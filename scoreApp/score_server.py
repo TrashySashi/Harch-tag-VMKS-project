@@ -21,8 +21,23 @@ from flask import Flask, Response, request, jsonify, render_template_string
 import threading
 import queue
 import json
+import time
+import logging
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-7s  %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("harchtag.score")
 
 app = Flask(__name__)
+
+
+def _client() -> str:
+    """Best-effort client identifier for logs (IP, honoring proxies)."""
+    fwd = request.headers.get("X-Forwarded-For", "")
+    return fwd.split(",")[0].strip() if fwd else (request.remote_addr or "?")
 
 # --- game state ----------------------------------------------------------
 _lock = threading.Lock()
@@ -50,16 +65,19 @@ def _broadcast(hits: int) -> None:
 def hit():
     """Vest reports a validated IR hit."""
     global _hits, _last_hit_ts
-    import time
 
     now = time.monotonic()
     with _lock:
         if now - _last_hit_ts < _DEBOUNCE_S:
+            since = now - _last_hit_ts
+            log.warning("HIT ignored (debounced %.0fms < %.0fms) from %s",
+                        since * 1000, _DEBOUNCE_S * 1000, _client())
             return jsonify(hits=_hits, counted=False)
         _last_hit_ts = now
         _hits += 1
         current = _hits
 
+    log.info("HIT from %s  ->  total hits = %d", _client(), current)
     _broadcast(current)
     return jsonify(hits=current, counted=True)
 
@@ -71,6 +89,7 @@ def reset():
     with _lock:
         _hits = 0
         current = _hits
+    log.info("RESET by %s  ->  new round, hits = 0", _client())
     _broadcast(current)
     return jsonify(hits=current)
 
@@ -79,16 +98,21 @@ def reset():
 def score():
     with _lock:
         current = _hits
+    log.debug("SCORE queried by %s  ->  %d", _client(), current)
     return jsonify(hits=current)
 
 
 @app.route("/events")
 def events():
     """Server-Sent Events: stream the hit count to the scoreboard page."""
+    client = _client()
+
     def stream():
         q: queue.Queue = queue.Queue()
         with _subscribers_lock:
             _subscribers.add(q)
+            count = len(_subscribers)
+        log.info("Scoreboard connected: %s  (%d watching)", client, count)
         try:
             # Send the current value immediately so a fresh page is correct.
             with _lock:
@@ -99,6 +123,8 @@ def events():
         finally:
             with _subscribers_lock:
                 _subscribers.discard(q)
+                count = len(_subscribers)
+            log.info("Scoreboard disconnected: %s  (%d watching)", client, count)
 
     return Response(stream(), mimetype="text/event-stream")
 
@@ -142,6 +168,31 @@ def index():
     return render_template_string(_PAGE)
 
 
+@app.errorhandler(Exception)
+def on_error(e):
+    """Log any unhandled failure with a full traceback, return JSON 500.
+
+    Normal HTTP errors (404, 405, ...) are passed through unchanged.
+    """
+    from werkzeug.exceptions import HTTPException
+
+    if isinstance(e, HTTPException):
+        log.warning("%s %s -> %d (%s)", request.method, request.path,
+                    e.code, e.name)
+        return e
+    log.exception("Request to %s %s failed: %s", request.method, request.path, e)
+    return jsonify(error=str(e)), 500
+
+
 if __name__ == "__main__":
     # Port 5001 so it can run alongside the camera app (port 5000) on the Pi.
-    app.run(host="0.0.0.0", port=5001, threaded=True)
+    PORT = 5001
+    log.info("HArch Tag score server starting on http://0.0.0.0:%d", PORT)
+    log.info("Endpoints: POST /hit  POST /reset  GET /score  GET /events  GET /")
+    try:
+        app.run(host="0.0.0.0", port=PORT, threaded=True)
+    except Exception:
+        log.exception("Server failed to start")
+        raise
+    finally:
+        log.info("Score server stopped")
