@@ -25,6 +25,12 @@ import queue
 import json
 import time
 import logging
+import os
+
+import requests
+from dotenv import load_dotenv
+
+load_dotenv()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -32,6 +38,11 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("harchtag.score")
+
+# Base URL of the probe / camera_stream server (port 5000). Configured via .env
+# so the Pi's address isn't hard-coded. e.g. PROBE_URL=http://10.62.210.69:5000
+PROBE_URL = os.getenv("PROBE_URL", "http://127.0.0.1:5000").rstrip("/")
+PROBE_TIMEOUT_S = float(os.getenv("PROBE_TIMEOUT_S", "3"))
 
 app = Flask(__name__)
 
@@ -69,23 +80,29 @@ def _broadcast(state: dict) -> None:
             q.put(state)
 
 
-def start_probe() -> None:
-    """Tell the probe (camera/aiming on the Pi) to start hunting.
+def _call_probe(action: str) -> None:
+    """POST /start or /stop to the probe (camera_stream) server.
 
-    MOCK: empty for now. Will eventually POST to the camera_stream server
-    (port 5000) to kick off detection + aiming. Kept as a no-op so the game
-    flow works before the probe side exists.
+    Failures are logged but never raise — a probe that's offline (e.g. during
+    laptop development) must not break the game flow on the score app.
     """
-    log.info("start_probe() called  (mock: probe start not yet wired)")
+    url = f"{PROBE_URL}/{action}"
+    try:
+        resp = requests.post(url, timeout=PROBE_TIMEOUT_S)
+        log.info("probe %s -> %s %d %s",
+                 action, url, resp.status_code, resp.text.strip())
+    except requests.RequestException as e:
+        log.warning("probe %s failed (%s): %s", action, url, e)
+
+
+def start_probe() -> None:
+    """Tell the probe (camera/aiming on the Pi) to start hunting."""
+    _call_probe("start")
 
 
 def stop_probe() -> None:
-    """Tell the probe to stop hunting and stand down.
-
-    MOCK: empty for now. Will eventually POST to the camera_stream server
-    (port 5000) to halt detection + aiming.
-    """
-    log.info("stop_probe() called  (mock: probe stop not yet wired)")
+    """Tell the probe to stop hunting and stand down."""
+    _call_probe("stop")
 
 
 @app.route("/start", methods=["POST"])
