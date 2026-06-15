@@ -119,12 +119,29 @@ These supersede anything in the original Word documentation:
 ### Scoring server (`scoreApp/`)
 - Standalone Flask app (`scoreApp/score_server.py`) that counts IR hits reported by the
   vest over **Wi-Fi**. Has **no camera/picamera2 dependency**, so it runs unchanged on a
-  laptop for development and on the Pi 5 for the game. State is a single in-memory hit
-  counter (resets on restart).
-- Endpoints: `POST /hit` (vest reports a hit; 0.3 s debounce so one shot counts once),
-  `POST /reset` (new round), `GET /score` (JSON), `GET /events` (SSE live stream),
-  `GET /` (live scoreboard page). Listens on **port 5001** so it coexists with the camera
-  app on port 5000.
+  laptop for development and on the Pi 5 for the game. State is **in-memory** and resets on
+  restart: `{"active": bool, "hits": int}` — `active` = is a game running, `hits` = score
+  (just the hit count; lower is better in this dodge game). Comprehensive logging on every
+  event (hits, debounced/ignored hits, start/stop, SSE connect/disconnect, errors).
+- **Game lifecycle (start/stop architecture).** The score app is the **game controller**;
+  the operator drives it from the web page:
+  - `POST /start` → set `active=true`, reset `hits` to 0, and call `start_probe()` to tell
+    the probe to begin hunting. The page swaps from the **home screen** to the **scoreboard**.
+  - `POST /stop` → set `active=false` and call `stop_probe()` to stand the probe down. The
+    page returns to the **home screen** (final score preserved).
+  - `start_probe()` / `stop_probe()` are currently **mocks** (log-only no-ops). They are the
+    seam where the score app will eventually POST to the camera/probe server (port 5000) to
+    actually start/stop detection + aiming. Wiring these is the main open task here.
+  - **Hits are only counted while `active`.** A `POST /hit` when no game is running is logged
+    and ignored — the vest can't rack up points before the operator starts a round.
+- **The web page shows exactly one screen at a time**, chosen by `active`: the home screen
+  (START GAME button) when deactivated, the scoreboard (live count, RESET ROUND, STOP GAME)
+  when activated. The correct screen is rendered **server-side** on load (no flash) and kept
+  in sync **live via SSE**.
+- **Endpoints:** `POST /start`, `POST /stop`, `POST /hit` (0.3 s debounce so one shot counts
+  once; only while active), `POST /reset` (zero the count, stay active), `GET /score` (JSON
+  state), `GET /events` (SSE stream of state), `GET /`. Listens on **port 5001** so it
+  coexists with the camera app on port 5000.
 - **Run it:**
   ```bash
   pip install -r scoreApp/requirements.txt   # one-time
@@ -132,12 +149,36 @@ These supersede anything in the original Word documentation:
   ```
   The vest then POSTs to `http://<pi-ip>:5001/hit`.
 
+### Vest firmware (`vest/`)
+- Arduino sketch for the **ESP32-WROOM-32** (`vest/vest.ino`). On a "hit" it connects to
+  Wi-Fi and sends `POST http://<server>:5001/hit` to the score app. Hardware needed for this
+  path is only the **board + a data USB cable** — no resistors/TSOP required yet, since the
+  hit is currently faked.
+- **Current loop is a stand-in:** it auto-fires a hit every 2 s (`reportHit(); delay(2000)`)
+  to exercise the scoring pipeline before IR hardware exists. The real version restores
+  edge-detection on a pin (button now, TSOP38238 later) with the same 300 ms debounce that
+  mirrors the server's. The button + debounce code is kept in the file for that swap.
+- **Credentials live in `vest/secrets.h`** (`WIFI_SSID`, `WIFI_PASS`, `SERVER_HOST`,
+  `SERVER_PORT`) — **git-ignored**. Copy `vest/secrets.example.h` → `vest/secrets.h` and fill
+  in values. The ESP32 has no OS env vars; `secrets.h` is the standard pattern and also works
+  in Wokwi.
+- **Simulating the vest** (no hardware): a real ESP32 on the same LAN is simplest (the Pi IP
+  just works). Web Wokwi (wokwi.com) can't reach a LAN/localhost server — it needs an ngrok
+  tunnel. **Wokwi for VS Code + the `wokwigw` gateway** gives true LAN access and compiles
+  locally (no cloud compile queue). A pure-Python stand-in (`POST /hit` in a loop) tests the
+  server without any ESP at all.
+
 ## Control flow between processors
+- **Score app (game controller, on the Pi):** the operator starts/stops a round from its web
+  page. `POST /start` activates scoring and signals the probe to start hunting (`start_probe()`,
+  mocked); `POST /stop` deactivates and stands the probe down (`stop_probe()`, mocked). Hits
+  only count while a round is active.
 - **Pi 5 (probe):** camera capture + YOLO detection → computes target position → drives
   the motion system (H-bridge for the cart motors, stepper/servo for aiming) **and** fires
-  the IR gun, all from the Pi's own GPIO.
-- **Vest ESP32-WROOM-32:** detects hits, runs local feedback, reports score to the Pi
-  over BLE or Wi-Fi.
+  the IR gun, all from the Pi's own GPIO. Eventually started/stopped by the score app's
+  `start_probe()` / `stop_probe()`.
+- **Vest ESP32-WROOM-32:** detects hits, runs local feedback, reports each hit to the score
+  app over Wi-Fi (`POST /hit`).
 
 ## Suggested build order (de-risked, incremental)
 

@@ -6,13 +6,15 @@ A small, self-contained Flask app that counts IR hits reported by the vest
 so it runs unchanged on a laptop for development and on the Pi 5 for the game.
 
 Endpoints
-    GET  /         live scoreboard page (auto-updates via SSE)
-    POST /hit      vest reports a hit; increments the counter
-    POST /reset    start a fresh round (counter back to 0)
-    GET  /score    current count as JSON: {"hits": N}
-    GET  /events   Server-Sent Events stream pushing the count on every change
+    GET  /         start screen + live scoreboard (auto-updates via SSE)
+    POST /start    begin a game: activate scoring, reset count, start the probe
+    POST /stop     end the game: deactivate scoring, stop the probe
+    POST /hit      vest reports a hit; counted only while a game is running
+    POST /reset    start a fresh round (counter back to 0, game stays active)
+    GET  /score    current state as JSON: {"active": bool, "hits": N}
+    GET  /events   Server-Sent Events stream pushing state on every change
 
-State is a single in-memory integer; it resets when the process restarts.
+State is in-memory; it resets when the process restarts.
 
 Run:  python score_server.py   (listens on 0.0.0.0:5001)
 """
@@ -42,9 +44,10 @@ def _client() -> str:
 # --- game state ----------------------------------------------------------
 _lock = threading.Lock()
 _hits = 0
+_active = False          # is a game currently running?
 
 # Each connected scoreboard browser registers a queue here; on every state
-# change we push the new count to all of them (Server-Sent Events).
+# change we push the new state to all of them (Server-Sent Events).
 _subscribers: "set[queue.Queue]" = set()
 _subscribers_lock = threading.Lock()
 
@@ -54,11 +57,65 @@ _DEBOUNCE_S = 0.3
 _last_hit_ts = 0.0
 
 
-def _broadcast(hits: int) -> None:
-    """Push the current count to every connected scoreboard."""
+def _snapshot() -> dict:
+    """Current game state as a plain dict. Call while holding _lock."""
+    return {"active": _active, "hits": _hits}
+
+
+def _broadcast(state: dict) -> None:
+    """Push the current game state to every connected scoreboard."""
     with _subscribers_lock:
         for q in _subscribers:
-            q.put(hits)
+            q.put(state)
+
+
+def start_probe() -> None:
+    """Tell the probe (camera/aiming on the Pi) to start hunting.
+
+    MOCK: empty for now. Will eventually POST to the camera_stream server
+    (port 5000) to kick off detection + aiming. Kept as a no-op so the game
+    flow works before the probe side exists.
+    """
+    log.info("start_probe() called  (mock: probe start not yet wired)")
+
+
+def stop_probe() -> None:
+    """Tell the probe to stop hunting and stand down.
+
+    MOCK: empty for now. Will eventually POST to the camera_stream server
+    (port 5000) to halt detection + aiming.
+    """
+    log.info("stop_probe() called  (mock: probe stop not yet wired)")
+
+
+@app.route("/start", methods=["POST"])
+def start():
+    """Begin a game: activate scoring, reset the count, start the probe."""
+    global _active, _hits, _last_hit_ts
+    with _lock:
+        _active = True
+        _hits = 0
+        _last_hit_ts = 0.0
+        snap = _snapshot()
+
+    log.info("GAME STARTED by %s", _client())
+    start_probe()          # mock for now — kicks off the camera/aiming probe
+    _broadcast(snap)
+    return jsonify(snap)
+
+
+@app.route("/stop", methods=["POST"])
+def stop():
+    """End the game: deactivate scoring, stop the probe, return to home."""
+    global _active
+    with _lock:
+        _active = False
+        snap = _snapshot()
+
+    log.info("GAME STOPPED by %s  ->  final hits = %d", _client(), snap["hits"])
+    stop_probe()           # mock for now — stands the probe down
+    _broadcast(snap)
+    return jsonify(snap)
 
 
 @app.route("/hit", methods=["POST"])
@@ -68,38 +125,41 @@ def hit():
 
     now = time.monotonic()
     with _lock:
+        if not _active:
+            log.warning("HIT ignored (no game running) from %s", _client())
+            return jsonify(_snapshot() | {"counted": False})
         if now - _last_hit_ts < _DEBOUNCE_S:
             since = now - _last_hit_ts
             log.warning("HIT ignored (debounced %.0fms < %.0fms) from %s",
                         since * 1000, _DEBOUNCE_S * 1000, _client())
-            return jsonify(hits=_hits, counted=False)
+            return jsonify(_snapshot() | {"counted": False})
         _last_hit_ts = now
         _hits += 1
-        current = _hits
+        snap = _snapshot()
 
-    log.info("HIT from %s  ->  total hits = %d", _client(), current)
-    _broadcast(current)
-    return jsonify(hits=current, counted=True)
+    log.info("HIT from %s  ->  total hits = %d", _client(), snap["hits"])
+    _broadcast(snap)
+    return jsonify(snap | {"counted": True})
 
 
 @app.route("/reset", methods=["POST"])
 def reset():
-    """Start a fresh round."""
+    """Start a fresh round (keeps the game active, zeroes the count)."""
     global _hits
     with _lock:
         _hits = 0
-        current = _hits
+        snap = _snapshot()
     log.info("RESET by %s  ->  new round, hits = 0", _client())
-    _broadcast(current)
-    return jsonify(hits=current)
+    _broadcast(snap)
+    return jsonify(snap)
 
 
 @app.route("/score")
 def score():
     with _lock:
-        current = _hits
-    log.debug("SCORE queried by %s  ->  %d", _client(), current)
-    return jsonify(hits=current)
+        snap = _snapshot()
+    log.debug("SCORE queried by %s  ->  %s", _client(), snap)
+    return jsonify(snap)
 
 
 @app.route("/events")
@@ -114,12 +174,12 @@ def events():
             count = len(_subscribers)
         log.info("Scoreboard connected: %s  (%d watching)", client, count)
         try:
-            # Send the current value immediately so a fresh page is correct.
+            # Send the current state immediately so a fresh page is correct.
             with _lock:
-                yield f"data: {json.dumps({'hits': _hits})}\n\n"
+                yield f"data: {json.dumps(_snapshot())}\n\n"
             while True:
-                hits = q.get()
-                yield f"data: {json.dumps({'hits': hits})}\n\n"
+                state = q.get()
+                yield f"data: {json.dumps(state)}\n\n"
         finally:
             with _subscribers_lock:
                 _subscribers.discard(q)
@@ -142,21 +202,56 @@ _PAGE = """<!doctype html>
     .count { font-size:9rem; font-weight:bold; line-height:1;
              color:#ff4040; text-shadow:0 0 20px rgba(255,64,64,.5); }
     .label { font-size:.9rem; color:#666; }
+    .intro { font-size:.85rem; color:#888; max-width:24rem; text-align:center; }
     button { font-family:monospace; font-size:.9rem; padding:10px 24px;
              background:#222; color:#eee; border:1px solid #444;
              border-radius:4px; cursor:pointer; }
     button:hover { background:#333; }
+    .start { font-size:1.2rem; padding:16px 40px; border-color:#ff4040;
+             color:#ff6b6b; }
+    .stop  { border-color:#ff4040; color:#ff6b6b; }
+    .hidden { display:none !important; }
   </style>
 </head>
 <body>
   <h1>HARCH TAG</h1>
-  <div class="count" id="count">0</div>
-  <div class="label">HITS TAKEN</div>
-  <button onclick="resetScore()">RESET ROUND</button>
+
+  <!-- Start screen: shown only while the probe is deactivated -->
+  <div id="startScreen" class="{{ 'hidden' if active else '' }}">
+    <p class="intro">Put on the vest, then start the game. The probe will begin
+       hunting and every IR hit you take is counted.</p>
+    <div style="text-align:center; margin-top:20px;">
+      <button class="start" onclick="startGame()">START GAME</button>
+    </div>
+  </div>
+
+  <!-- Scoreboard: shown only while the probe is activated -->
+  <div id="scoreScreen" class="{{ '' if active else 'hidden' }}"
+       style="display:flex; flex-direction:column; align-items:center; gap:24px;">
+    <div class="count" id="count">{{ hits }}</div>
+    <div class="label">HITS TAKEN</div>
+    <div style="display:flex; gap:12px;">
+      <button onclick="resetScore()">RESET ROUND</button>
+      <button class="stop" onclick="stopGame()">STOP GAME</button>
+    </div>
+  </div>
+
   <script>
-    const el = document.getElementById("count");
+    const startScreen = document.getElementById("startScreen");
+    const scoreScreen = document.getElementById("scoreScreen");
+    const count = document.getElementById("count");
+
+    function render(state) {
+      count.textContent = state.hits;
+      startScreen.classList.toggle("hidden", state.active);
+      scoreScreen.classList.toggle("hidden", !state.active);
+    }
+
     const es = new EventSource("/events");
-    es.onmessage = (e) => { el.textContent = JSON.parse(e.data).hits; };
+    es.onmessage = (e) => render(JSON.parse(e.data));
+
+    function startGame()  { fetch("/start", { method: "POST" }); }
+    function stopGame()   { fetch("/stop",  { method: "POST" }); }
     function resetScore() { fetch("/reset", { method: "POST" }); }
   </script>
 </body>
@@ -165,7 +260,11 @@ _PAGE = """<!doctype html>
 
 @app.route("/")
 def index():
-    return render_template_string(_PAGE)
+    with _lock:
+        snap = _snapshot()
+    # Render the correct screen server-side so there's no flash of the wrong
+    # one before the first SSE update arrives.
+    return render_template_string(_PAGE, active=snap["active"], hits=snap["hits"])
 
 
 @app.errorhandler(Exception)
@@ -188,7 +287,7 @@ if __name__ == "__main__":
     # Port 5001 so it can run alongside the camera app (port 5000) on the Pi.
     PORT = 5001
     log.info("HArch Tag score server starting on http://0.0.0.0:%d", PORT)
-    log.info("Endpoints: POST /hit  POST /reset  GET /score  GET /events  GET /")
+    log.info("Endpoints: POST /start  POST /stop  POST /hit  POST /reset  GET /score  GET /events  GET /")
     try:
         app.run(host="0.0.0.0", port=PORT, threaded=True)
     except Exception:
