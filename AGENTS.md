@@ -116,6 +116,22 @@ These supersede anything in the original Word documentation:
   Pi↔vest link, Wi-Fi if a server/logging is wanted. Pi handles detection and high-level
   game state.
 
+### Scoring server (`scoreApp/`)
+- Standalone Flask app (`scoreApp/score_server.py`) that counts IR hits reported by the
+  vest over **Wi-Fi**. Has **no camera/picamera2 dependency**, so it runs unchanged on a
+  laptop for development and on the Pi 5 for the game. State is a single in-memory hit
+  counter (resets on restart).
+- Endpoints: `POST /hit` (vest reports a hit; 0.3 s debounce so one shot counts once),
+  `POST /reset` (new round), `GET /score` (JSON), `GET /events` (SSE live stream),
+  `GET /` (live scoreboard page). Listens on **port 5001** so it coexists with the camera
+  app on port 5000.
+- **Run it:**
+  ```bash
+  pip install -r scoreApp/requirements.txt   # one-time
+  python scoreApp/score_server.py            # serves on 0.0.0.0:5001
+  ```
+  The vest then POSTs to `http://<pi-ip>:5001/hit`.
+
 ## Control flow between processors
 - **Pi 5 (probe):** camera capture + YOLO detection → computes target position → drives
   the motion system (H-bridge for the cart motors, stepper/servo for aiming) **and** fires
