@@ -216,3 +216,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# HArch Tag — vest credentials (keep secrets.example.h, ignore the real one)
+vest/secrets.h

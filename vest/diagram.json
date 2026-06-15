@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "author": "HArch Tag",
+  "editor": "wokwi",
+  "parts": [
+    { "type": "wokwi-esp32-devkit-v1", "id": "esp", "top": 0, "left": 0, "attrs": {} },
+    { "type": "wokwi-pushbutton", "id": "btn", "top": 150, "left": 200,
+      "attrs": { "color": "red", "label": "HIT" } }
+  ],
+  "connections": [
+    [ "esp:GND.1", "btn:1.l", "black", [] ],
+    [ "esp:D4", "btn:2.l", "green", [] ]
+  ]
+}
