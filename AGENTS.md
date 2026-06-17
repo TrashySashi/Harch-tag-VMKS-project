@@ -82,7 +82,7 @@ These supersede anything in the original Word documentation:
 | Function | Hardware |
 |---|---|
 | Controller | ESP32-WROOM-32 DevKitC (dual-core Xtensa; Wi-Fi + Bluetooth Classic + BLE) |
-| Hit detection | 10× TSOP38238 (38 kHz IR receiver modules) — front, back, shoulders for ~360° coverage |
+| Hit detection | 10× TSOP38238 (38 kHz IR receiver modules) — arrayed across the **chest (front only)** for forward-facing coverage; domes all point forward, with the left/right columns angled ~30° outward. (Back/shoulder/360° coverage was dropped to simplify the build.) |
 | Per-sensor noise filter | ~100 Ω series resistor on VCC + ~4.7 µF cap across VCC–GND (per datasheet) |
 | Player feedback (planned) | Buzzer, LED, vibration motor (motor driven via transistor) |
 | Power | Li-ion + UPS/charger module, regulated to 3.3 V |
@@ -225,13 +225,15 @@ Three files, each with a single responsibility:
 
 ### Vest firmware (`vest/`)
 - Arduino sketch for the **ESP32-WROOM-32** (`vest/vest.ino`). On a "hit" it connects to
-  Wi-Fi and sends `POST http://<server>:5001/hit` to the score app. Hardware needed for this
-  path is only the **board + a data USB cable** — no resistors/TSOP required yet, since the
-  hit is currently faked.
-- **Current loop is a stand-in:** it auto-fires a hit every 2 s (`reportHit(); delay(2000)`)
-  to exercise the scoring pipeline before IR hardware exists. The real version restores
-  edge-detection on a pin (button now, TSOP38238 later) with the same 300 ms debounce that
-  mirrors the server's. The button + debounce code is kept in the file for that swap.
+  Wi-Fi and sends `POST http://<server>:5001/hit` to the score app.
+- **Hit detection is real now:** the loop reads a **TSOP38238** on `TSOP_PIN` (GPIO 4), whose
+  OUT line is **active-LOW** while it sees a 38 kHz IR "shot". One hit is reported per **falling
+  edge** (HIGH→LOW) with a **300 ms debounce** (`DEBOUNCE_MS`) mirroring the server, so one shot
+  counts once. (The earlier stand-in that auto-fired a hit every 2 s is gone.)
+- **Wiring:** TSOP pins (dome facing you, left→right) 1=OUT→GPIO 4, 2=GND→GND, 3=VCC→3V3, plus
+  the datasheet noise filter (~100 Ω series on VCC + ~4.7 µF across VCC–GND). For a **Wokwi**
+  test use a pushbutton to GND in place of the TSOP — it pulls the pin LOW the same way, so the
+  hit logic is unchanged; any TV remote works as the 38 kHz source on real hardware.
 - **Credentials live in `vest/secrets.h`** (`WIFI_SSID`, `WIFI_PASS`, `SERVER_HOST`,
   `SERVER_PORT`) — **git-ignored**. Copy `vest/secrets.example.h` → `vest/secrets.h` and fill
   in values. The ESP32 has no OS env vars; `secrets.h` is the standard pattern and also works
@@ -263,7 +265,8 @@ Three files, each with a single responsibility:
 1. One TSOP + ESP32-WROOM-32 → print "HIT" on serial when it sees the gun.
 2. Gun side: TSAL6200 + IRremote sending a shot code; vest decodes and validates it.
 3. Add feedback (buzzer/LED/vibration).
-4. Scale to 10 TSOPs (OUT lines may be tied together if only hit/no-hit is needed).
+4. Scale to 10 TSOPs in a chest array (front only; 3–4–3 grid or similar, domes forward,
+   edge columns angled ~30° out). OUT lines may be tied together since only hit/no-hit is needed.
 5. Add BLE reporting.
 6. Add battery + make wearable.
 

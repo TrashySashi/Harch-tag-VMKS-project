@@ -18,8 +18,9 @@ Two physical components that talk wirelessly:
 - **Probe (the shooter):** a moving platform (4-wheel BO-motor cart) carrying a Raspberry Pi
   5 + Camera Module 3. The Pi runs object detection to find the player, aims, and fires an
   IR LED array (TSAL6200). The Pi drives everything directly.
-- **Vest (the target):** worn by the player, studded with 10 TSOP IR receivers that detect
-  hits, run by an ESP32-WROOM-32 DevKitC, with local feedback and wireless score reporting.
+- **Vest (the target):** worn by the player, with 10 TSOP IR receivers arrayed across the
+  **chest (front only)** that detect hits, run by an ESP32-WROOM-32 DevKitC, with local
+  feedback and wireless score reporting.
 
 Core loop: **camera sees player → Pi detects + aims → fires IR → vest registers the hit.**
 
@@ -64,8 +65,11 @@ Core loop: **camera sees player → Pi detects + aims → fires IR → vest regi
 1. One TSOP + ESP32-WROOM-32 → print "HIT" on serial when it sees the gun.
 2. Gun side: TSAL6200 + 38 kHz modulated code; vest decodes and validates the "shot" code.
 3. Add local feedback (buzzer / LED / vibration motor).
-4. Scale to 10 TSOPs for ~360° coverage (OUT lines may be tied together if only hit/no-hit
-   matters).
+4. Scale to 10 TSOPs in a **chest array (front only)** — a 3–4–3 grid (or similar even
+   spacing) spanning shoulder-to-shoulder × collarbone-to-sternum, all domes forward, the
+   left/right columns angled ~30° outward to catch slightly off-axis shots. OUT lines may be
+   tied together since only hit/no-hit matters. (360°/back/shoulder coverage was dropped to
+   simplify the build.)
 5. Add wireless score reporting (BLE or Wi-Fi) to the Pi/server.
 6. Add battery + make wearable (regulated 3.3 V).
 
