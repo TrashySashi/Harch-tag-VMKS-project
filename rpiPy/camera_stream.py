@@ -1,11 +1,13 @@
-from flask import Flask, Response, render_template_string
+from flask import Flask, Response, render_template_string, jsonify
 from picamera2 import Picamera2
 import cv2
 import numpy as np
 import threading
 import time
+import ups_monitor
 
 app = Flask(__name__)
+ups_monitor.start()
 
 picam2 = Picamera2(0)
 config = picam2.create_video_configuration(
@@ -175,6 +177,7 @@ _PAGE = """<!doctype html>
     h1   { color:#eee; font-family:monospace; font-size:.95rem; margin:0; }
     img  { max-width:100%; border:2px solid #333; border-radius:4px; }
     p    { color:#666; font-family:monospace; font-size:.75rem; margin:0; }
+    a    { color:#4af; font-family:monospace; font-size:.85rem; }
   </style>
 </head>
 <body>
@@ -183,6 +186,93 @@ _PAGE = """<!doctype html>
   <p>Green outline = detected shirt &nbsp;|&nbsp;
      Orange arrows = direction to rotate camera &nbsp;|&nbsp;
      CENTERED = shirt in deadzone</p>
+  <a href="/ups">UPS Monitor &rarr;</a>
+</body>
+</html>"""
+
+_UPS_PAGE = """<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>UPS Monitor</title>
+  <style>
+    *    { box-sizing:border-box; }
+    body { margin:0; background:#111; color:#eee; font-family:monospace;
+           display:flex; flex-direction:column; align-items:center;
+           justify-content:center; min-height:100vh; gap:24px; }
+    h1   { font-size:1rem; margin:0; }
+    .cards { display:flex; flex-wrap:wrap; gap:16px; justify-content:center; }
+    .card  { background:#1e1e1e; border:1px solid #333; border-radius:8px;
+             padding:18px 28px; text-align:center; min-width:150px; }
+    .card .val  { font-size:2rem; font-weight:bold; margin:4px 0; }
+    .card .lbl  { font-size:.75rem; color:#888; }
+    .bar-wrap   { width:320px; background:#333; border-radius:6px; height:22px; overflow:hidden; }
+    .bar        { height:100%; border-radius:6px; transition:width .5s; }
+    .status     { font-size:1.1rem; padding:6px 18px; border-radius:20px; }
+    .charging   { background:#1a4a1a; color:#4f4; border:1px solid #4f4; }
+    .discharging{ background:#4a1a1a; color:#f44; border:1px solid #f44; }
+    .unavail    { color:#666; font-size:.9rem; }
+    a           { color:#4af; font-size:.85rem; }
+  </style>
+</head>
+<body>
+  <h1>Waveshare UPS Module 3S</h1>
+  <div id="unavail" class="unavail" style="display:none">
+    UPS not detected — check wiring or run: sudo raspi-config → Interface → I2C
+  </div>
+  <div id="content">
+    <div class="cards">
+      <div class="card">
+        <div class="lbl">Battery</div>
+        <div class="val" id="pct">--%</div>
+        <div class="bar-wrap"><div class="bar" id="bar" style="width:0%;background:#4f4"></div></div>
+      </div>
+      <div class="card">
+        <div class="lbl">Voltage</div>
+        <div class="val" id="volt">-- V</div>
+        <div class="lbl">3S Li-ion (9–12.6 V)</div>
+      </div>
+      <div class="card">
+        <div class="lbl">Current</div>
+        <div class="val" id="curr">-- mA</div>
+        <div class="lbl">negative = charging</div>
+      </div>
+      <div class="card">
+        <div class="lbl">Power</div>
+        <div class="val" id="pwr">-- W</div>
+        <div class="lbl">load consumption</div>
+      </div>
+    </div>
+    <div id="status" class="status discharging">--</div>
+  </div>
+  <a href="/">&#8592; Camera</a>
+  <script>
+    async function refresh() {
+      try {
+        const d = await fetch('/ups/data').then(r => r.json());
+        if (!d.available) {
+          document.getElementById('unavail').style.display = '';
+          document.getElementById('content').style.display = 'none';
+          return;
+        }
+        document.getElementById('unavail').style.display = 'none';
+        document.getElementById('content').style.display = '';
+        const p = d.percent;
+        document.getElementById('pct').textContent   = p.toFixed(1) + '%';
+        document.getElementById('volt').textContent  = d.voltage_v.toFixed(3) + ' V';
+        document.getElementById('curr').textContent  = d.current_ma.toFixed(0) + ' mA';
+        document.getElementById('pwr').textContent   = d.power_w.toFixed(2) + ' W';
+        const bar = document.getElementById('bar');
+        bar.style.width = p + '%';
+        bar.style.background = p > 50 ? '#4f4' : p > 20 ? '#fa4' : '#f44';
+        const st = document.getElementById('status');
+        st.textContent  = d.status;
+        st.className    = 'status ' + (d.charging ? 'charging' : 'discharging');
+      } catch(e) {}
+    }
+    refresh();
+    setInterval(refresh, 2000);
+  </script>
 </body>
 </html>"""
 
@@ -198,6 +288,20 @@ def video_feed():
         _mjpeg_generator(),
         mimetype="multipart/x-mixed-replace; boundary=frame",
     )
+
+
+@app.route("/ups")
+def ups_page():
+    return render_template_string(_UPS_PAGE)
+
+
+@app.route("/ups/data")
+def ups_data():
+    data = ups_monitor.latest()
+    if data is None:
+        return jsonify({"available": False})
+    data["available"] = True
+    return jsonify(data)
 
 
 if __name__ == "__main__":
