@@ -282,6 +282,28 @@ def index():
     return render_template_string(_PAGE)
 
 
+@app.route("/start", methods=["POST"])
+def start():
+    """Start the probe (detection/aiming/firing).
+
+    SKELETON: accepts the request and reports success. No probe logic is wired
+    yet — the score app calls this to begin a game.
+    """
+    print("[probe] /start received — (skeleton, no logic yet)")
+    return jsonify(status="ok", probe="started")
+
+
+@app.route("/stop", methods=["POST"])
+def stop():
+    """Stop the probe (detection/aiming/firing).
+
+    SKELETON: accepts the request and reports success. No probe logic is wired
+    yet — the score app calls this to end a game.
+    """
+    print("[probe] /stop received — (skeleton, no logic yet)")
+    return jsonify(status="ok", probe="stopped")
+
+
 @app.route("/video_feed")
 def video_feed():
     return Response(
