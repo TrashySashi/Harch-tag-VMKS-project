@@ -133,9 +133,17 @@ contour above 3000 px², centroid (cx, cy), X/Y offset from frame center as pixe
 - Standalone Flask app (`scoreApp/score_server.py`) that counts IR hits reported by the
   vest over **Wi-Fi**. Has **no camera/picamera2 dependency**, so it runs unchanged on a
   laptop for development and on the Pi 5 for the game. State is **in-memory** and resets on
-  restart: `{"active": bool, "hits": int}` — `active` = is a game running, `hits` = score
-  (just the hit count; lower is better in this dodge game). Comprehensive logging on every
-  event (hits, debounced/ignored hits, start/stop, SSE connect/disconnect, errors).
+  restart: `{"active": bool, "hits": int, "shots": int, "misses": int}` — `active` = is a
+  game running, `hits` = IR hits the vest registered (lower is better in this dodge game),
+  `shots` = shots the probe reported firing, `misses` = `max(0, shots - hits)`. Comprehensive
+  logging on every event (hits, shots, debounced/ignored hits and shots, start/stop, SSE
+  connect/disconnect, errors).
+- **Three counters, one derived.** `hits` and `shots` come from two independent devices that
+  don't talk to each other (the vest reports `/hit`, the probe reports `/shot`), so `misses`
+  is **never stored** — it is recomputed as `max(0, shots - hits)` on every `/hit` and every
+  `/shot`. Recomputing from both sources on each event (rather than incrementing a third
+  counter) keeps the two sources from drifting out of sync; the clamp at 0 absorbs the case
+  where a hit is logged just before its corresponding shot. All three show on the scoreboard.
 - **Game lifecycle (start/stop architecture).** The score app is the **game controller**;
   the operator drives it from the web page:
   - `POST /start` → set `active=true`, reset `hits` to 0, and call `start_probe()` to tell
@@ -153,7 +161,8 @@ contour above 3000 px², centroid (cx, cy), X/Y offset from frame center as pixe
   when activated. The correct screen is rendered **server-side** on load (no flash) and kept
   in sync **live via SSE**.
 - **Endpoints:** `POST /start`, `POST /stop`, `POST /hit` (0.3 s debounce so one shot counts
-  once; only while active), `POST /reset` (zero the count, stay active), `GET /score` (JSON
+  once; only while active), `POST /shot` (probe reports a fired shot; same 0.3 s debounce;
+  only while active), `POST /reset` (zero both counters, stay active), `GET /score` (JSON
   state), `GET /events` (SSE stream of state), `GET /`. Listens on **port 5001** so it
   coexists with the camera app on port 5000.
 - **Run it:**

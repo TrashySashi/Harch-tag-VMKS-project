@@ -220,12 +220,35 @@ Browser → POST /start (score_server :5001)
       → _game_loop() begins tracking and firing
 ```
 
+### score_server.py — shots & misses (added)
+
+The scoreboard now tracks **three** figures instead of one:
+
+- `hits` — IR hits the vest registers, reported by the vest via `POST /hit` (unchanged).
+- `shots` — shots fired, reported by the probe via the new `POST /shot` endpoint. Same 0.3 s
+  debounce as `/hit` (own timestamp `_last_shot_ts`), only counted while a round is active.
+- `misses` — `max(0, shots - hits)`. **Not stored** — `_snapshot()` derives it on every call,
+  so it is recomputed on each `/hit` and each `/shot`. The hit and shot counts arrive from two
+  devices that don't talk to each other, so recomputing from both on every event (rather than
+  bumping a separate counter in one place) is what keeps them consistent; the clamp at 0
+  absorbs a hit that lands just before its shot is reported.
+
+`/start` and `/reset` zero both counters (and both debounce timestamps). All three numbers
+render server-side on load and update live over the existing SSE stream — shots (grey) and
+misses (amber) flank the big red hit count.
+
+> **Not yet wired:** the probe (`rpiPy/`) does not call `POST /shot` yet. `hardware.fire()` /
+> the game loop in `camera_stream.py` will need to report each shot to the score app — left
+> untouched for now per scope.
+
 ---
 
 ## 10. Open items / TODO
 
 - [x] Wire score app `start_probe()` / `stop_probe()` to the probe server — **done**
       (real HTTP calls; probe `/start`/`/stop` flip `_game_active` Event).
+- [ ] Wire the probe to report fired shots — have `camera_stream.py` `POST /shot` to the
+      score app (port 5001) each time it fires, so the scoreboard's shots/misses are live.
 - [ ] Wire `hardware.py` — replace mock stubs with real servo driver + fire mechanism.
 - [ ] Tune `_K_PAN` / `_K_TILT` gain constants once servos are connected.
 - [ ] Resolve probe motion: wheeled BO-motor cart vs. the linear-rail + stepper/servo aiming
