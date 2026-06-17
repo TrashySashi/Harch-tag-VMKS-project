@@ -11,3 +11,7 @@ numpy>=1.24
 smbus2>=0.4          # INA219 / UPS monitor over I2C
 requests>=2.31       # hardware.fire() -> score app POST /shot
 python-dotenv>=1.0   # load SCORE_URL from .env
+gpiozero>=2.0        # cart motor control (L298N) — falls back to mock off-Pi
+# Pi-only pin backend for gpiozero on Raspberry Pi 5. Install on the Pi:
+#   sudo apt install -y python3-lgpio   (or: pip install lgpio)
+# Off-Pi it isn't needed — hardware.py mocks the drive when it can't init.
