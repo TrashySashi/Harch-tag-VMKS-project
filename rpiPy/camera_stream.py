@@ -5,6 +5,7 @@ import numpy as np
 import threading
 import time
 import ups_monitor
+import hardware
 
 app = Flask(__name__)
 ups_monitor.start()
@@ -19,6 +20,20 @@ picam2.start()
 
 _frame_lock = threading.Lock()
 _latest_frame = None
+
+_target_lock  = threading.Lock()
+_target_state = {"detected": False, "centered": False, "off_x": 0, "off_y": 0}
+
+_game_active = threading.Event()
+
+# Proportional-controller gains (degrees of servo movement per pixel of offset).
+# Tune these once real servos are connected.
+_K_PAN  = 0.05
+_K_TILT = 0.05
+_FIRE_COOLDOWN = 1.0   # seconds between shots
+
+_pan_angle  = 0.0
+_tilt_angle = 0.0
 
 # Red wraps around both ends of the HSV hue wheel (0-10 and 170-180)
 _RED_LOWER1 = np.array([0,   110,  60])
@@ -87,16 +102,19 @@ def _process(frame):
     # --- find shirt contour ----------------------------------------------
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    if not contours:
+    def _no_target():
+        with _target_lock:
+            _target_state.update({"detected": False, "centered": False, "off_x": 0, "off_y": 0})
         cv2.putText(frame, "NO RED TARGET", (cx - 130, 50),
                     cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0, 0, 255), 2)
         return frame
 
+    if not contours:
+        return _no_target()
+
     largest = max(contours, key=cv2.contourArea)
     if cv2.contourArea(largest) < _MIN_AREA:
-        cv2.putText(frame, "NO RED TARGET", (cx - 130, 50),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0, 0, 255), 2)
-        return frame
+        return _no_target()
 
     # Draw shirt outline
     cv2.drawContours(frame, [largest], -1, _CONTOUR_COLOR, 2)
@@ -128,6 +146,14 @@ def _process(frame):
     in_x = abs(off_x) <= dz_x
     in_y = abs(off_y) <= dz_y
 
+    with _target_lock:
+        _target_state.update({
+            "detected": True,
+            "centered": in_x and in_y,
+            "off_x":    off_x,
+            "off_y":    off_y,
+        })
+
     if in_x and in_y:
         cv2.putText(frame, "CENTERED", (cx - 75, 50),
                     cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0, 255, 0), 2)
@@ -138,6 +164,37 @@ def _process(frame):
             _draw_arrow(frame, "UP"    if off_y < 0 else "DOWN",  h, w)
 
     return frame
+
+
+def _game_loop():
+    global _pan_angle, _tilt_angle
+    while True:
+        _game_active.wait()           # idle until /start
+        print("[game] started")
+        _pan_angle = _tilt_angle = 0.0
+        hardware.home()
+        last_fire = 0.0
+
+        while _game_active.is_set():
+            with _target_lock:
+                state = dict(_target_state)
+
+            if state["detected"]:
+                if not state["centered"]:
+                    _pan_angle  += _K_PAN  * state["off_x"]
+                    _tilt_angle += _K_TILT * state["off_y"]
+                    hardware.set_pan(_pan_angle)
+                    hardware.set_tilt(_tilt_angle)
+                else:
+                    now = time.time()
+                    if now - last_fire >= _FIRE_COOLDOWN:
+                        hardware.fire()
+                        last_fire = now
+
+            time.sleep(0.05)          # 20 Hz control loop
+
+        hardware.home()
+        print("[game] stopped")
 
 
 def _capture_loop():
@@ -284,23 +341,13 @@ def index():
 
 @app.route("/start", methods=["POST"])
 def start():
-    """Start the probe (detection/aiming/firing).
-
-    SKELETON: accepts the request and reports success. No probe logic is wired
-    yet — the score app calls this to begin a game.
-    """
-    print("[probe] /start received — (skeleton, no logic yet)")
+    _game_active.set()
     return jsonify(status="ok", probe="started")
 
 
 @app.route("/stop", methods=["POST"])
 def stop():
-    """Stop the probe (detection/aiming/firing).
-
-    SKELETON: accepts the request and reports success. No probe logic is wired
-    yet — the score app calls this to end a game.
-    """
-    print("[probe] /stop received — (skeleton, no logic yet)")
+    _game_active.clear()
     return jsonify(status="ok", probe="stopped")
 
 
@@ -328,4 +375,5 @@ def ups_data():
 
 if __name__ == "__main__":
     threading.Thread(target=_capture_loop, daemon=True).start()
+    threading.Thread(target=_game_loop,    daemon=True).start()
     app.run(host="0.0.0.0", port=5000, threaded=True)
