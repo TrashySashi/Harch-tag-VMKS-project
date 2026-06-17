@@ -1,19 +1,27 @@
 """
-Hardware abstraction for pan/tilt servos and firing mechanism.
+Hardware abstraction for the probe: cart movement (aiming) + firing mechanism.
 
-MOCKED — replace each function body with real driver calls once hardware is
-connected. Angles are degrees relative to home (0, 0).
+The camera is mounted on the SIDE of the cart, so horizontal aiming is done by
+rotating the whole 4-wheel cart in place rather than panning a servo. There is
+no vertical (tilt) axis — gun elevation is fixed. The cart uses tank/differential
+steering: the two LEFT wheels move together and the two RIGHT wheels move
+together, driven by an L298N H-bridge through gpiozero.
+
+Rotation strategy = PIVOT (drive one side, the other stays stopped):
+  - clockwise   → target is to the LEFT of the frame  → drive LEFT side forward
+  - anti-clock  → target is to the RIGHT of the frame → drive RIGHT side forward
+If the cart turns the wrong way for your wiring, flip ``_INVERT_ROTATION``.
+
+If gpiozero (or its Pi pin backend) isn't available — e.g. when developing on a
+laptop — the drive functions fall back to printing ``[MOCK hw]`` so the rest of
+the pipeline still runs.
 
 `fire()` is still a mock (no IR LED is pulsed yet), but it DOES report the shot
 to the score app over HTTP (POST /shot) so the scoring pipeline can be exercised
 end-to-end before the firing hardware exists. The score app's address is read
 from a .env file (SCORE_URL); copy .env.example to .env to configure it.
 
-Pan/tilt driver options (pick one when ready):
-  - Direct GPIO PWM:    RPi.GPIO or gpiozero Servo
-  - I2C servo driver:   PCA9685 via adafruit-circuitpython-pca9685
-
-Fire mechanism options:
+Fire mechanism options (pick one when ready):
   - GPIO relay/solenoid: GPIO.output(FIRE_PIN, HIGH/LOW)
   - Trigger servo:       sweep from rest angle to pull angle
 """
@@ -33,22 +41,73 @@ log = logging.getLogger("harchtag.hardware")
 SCORE_URL = os.getenv("SCORE_URL", "http://127.0.0.1:5001").rstrip("/")
 SCORE_TIMEOUT_S = float(os.getenv("SCORE_TIMEOUT_S", "3"))
 
-_PAN_MIN,  _PAN_MAX  = -90.0, 90.0   # degrees; negative = left
-_TILT_MIN, _TILT_MAX = -45.0, 45.0   # degrees; negative = up
+# --- Cart drive (L298N via gpiozero) -------------------------------------
+# L298N pin map in BCM numbering. Each channel = 2 direction pins + 1 PWM
+# enable pin. Adjust these to match your wiring (EN pins should be PWM-capable;
+# 18 and 13 are hardware-PWM lines on the Pi). Avoid the I2C pins (GPIO 2/3)
+# used by the UPS monitor.
+# _LEFT_IN1,  _LEFT_IN2,  _LEFT_EN  = 23, 24, 13   # left wheel pair
+# _RIGHT_IN1, _RIGHT_IN2, _RIGHT_EN = 27, 17, 18   # right wheel pair
+
+_LEFT_IN1,  _LEFT_IN2,  _LEFT_EN  = 23, 24, 13   # left wheel pair
+_RIGHT_IN1, _RIGHT_IN2, _RIGHT_EN = 27, 17, 18  
+
+# Fixed rotation speed (PWM duty, 0.0–1.0) for bang-bang aiming.
+_DRIVE_SPEED = 0.6
+
+# Set True if the cart spins the wrong way relative to the target side.
+_INVERT_ROTATION = False
+
+try:
+    from gpiozero import Motor
+
+    _left = Motor(forward=_LEFT_IN1, backward=_LEFT_IN2, enable=_LEFT_EN)
+    _right = Motor(forward=_RIGHT_IN1, backward=_RIGHT_IN2, enable=_RIGHT_EN)
+    _MOCK_DRIVE = False
+    log.info("cart drive ready (L298N via gpiozero)")
+except Exception as e:  # gpiozero missing or not on a Pi → mock the drive
+    _left = _right = None
+    _MOCK_DRIVE = True
+    log.warning("cart drive mocked (gpiozero unavailable: %s)", e)
 
 
-def set_pan(angle: float) -> None:
-    """Drive pan servo to *angle* degrees."""
-    angle = max(_PAN_MIN, min(_PAN_MAX, angle))
-    # TODO: pwm.set_angle(PAN_CHANNEL, angle)
-    print(f"[MOCK hw] pan  → {angle:+.1f}°")
+def _pivot(direction: str) -> None:
+    """Pivot the cart by driving ONE side forward; the other side stays stopped.
+
+    *direction* is ``"cw"`` (clockwise) or ``"ccw"`` (anti-clockwise).
+    """
+    if _INVERT_ROTATION:
+        direction = "ccw" if direction == "cw" else "cw"
+
+    if _MOCK_DRIVE:
+        print(f"[MOCK hw] rotate {direction.upper()}")
+        return
+
+    if direction == "cw":
+        _left.forward(_DRIVE_SPEED)
+        _right.stop()
+    else:
+        _right.forward(_DRIVE_SPEED)
+        _left.stop()
 
 
-def set_tilt(angle: float) -> None:
-    """Drive tilt servo to *angle* degrees."""
-    angle = max(_TILT_MIN, min(_TILT_MAX, angle))
-    # TODO: pwm.set_angle(TILT_CHANNEL, angle)
-    print(f"[MOCK hw] tilt → {angle:+.1f}°")
+def rotate_cw() -> None:
+    """Spin the cart clockwise (target is to the LEFT of the frame)."""
+    _pivot("cw")
+
+
+def rotate_ccw() -> None:
+    """Spin the cart anti-clockwise (target is to the RIGHT of the frame)."""
+    _pivot("ccw")
+
+
+def stop_drive() -> None:
+    """Stop both wheel pairs."""
+    if _MOCK_DRIVE:
+        print("[MOCK hw] drive STOP")
+        return
+    _left.stop()
+    _right.stop()
 
 
 def _report_shot() -> None:
@@ -79,7 +138,6 @@ def stop_fire() -> None:
 
 
 def home() -> None:
-    """Return servos to centre and disengage firing."""
-    set_pan(0.0)
-    set_tilt(0.0)
+    """Stop the cart and disengage firing (safe idle state)."""
+    stop_drive()
     stop_fire()

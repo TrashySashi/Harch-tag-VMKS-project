@@ -90,10 +90,14 @@ decodes the code. Per the TSOP datasheet, add a noise filter on each sensor's po
   flattened (oval/double-D) shaft — the wheel hole must match the shaft profile.
   - "Won't go in fully" is usually: shaft bottoming out in a blind hole, the flats not
     aligned, or molding flash inside the hole. Don't force it — the gearbox is plastic.
-- **You cannot drive motors directly from the Pi/ESP pins.** Use a **motor driver / H-bridge**
-  (e.g. L298N) + a **separate motor battery**, and **tie all grounds together**.
+- **You cannot drive motors directly from the Pi pins.** Use a **motor driver / H-bridge**
+  (we use an **L298N**) + a **separate motor battery**, and **tie all grounds together**.
 - Steering: wire the left pair and right pair together → **differential/tank steering**.
-  Direction = two pins per channel; speed = a **PWM** signal.
+  Direction = two pins per channel; speed = a **PWM** enable pin. The **Pi drives the L298N
+  directly via gpiozero** (`Motor` per side) — see `rpiPy/hardware.py`.
+- **Aiming by rotation:** the camera sits on the *side* of the cart, so the cart rotates in
+  place to aim left/right at the player (no pan/tilt servo). We pivot one side at a time at a
+  fixed speed; `_INVERT_ROTATION` in `hardware.py` flips the direction if it's mirrored.
 
 ---
 
@@ -172,19 +176,24 @@ Fully working on the Pi. Three daemon threads run concurrently:
 
 - **`_capture_loop`** — grabs frames from the Pi Camera Module 3 via Picamera2 (1280×720,
   30 fps, RGB888). Calls `_process()` on each frame and stores the result in `_latest_frame`.
-- **`_game_loop`** — 20 Hz P-controller. Reads `_target_state` (written by `_process`) and
+- **`_game_loop`** — 20 Hz control loop. Reads `_target_state` (written by `_process`) and
   drives hardware:
-  - Target detected and not centered → nudge pan/tilt angles by `off_x * _K_PAN` /
-    `off_y * _K_TILT` and call `hardware.set_pan()` / `hardware.set_tilt()`.
+  - **Aiming = rotating the cart.** The camera is mounted on the *side* of the cart, so
+    horizontal aiming is done by spinning the whole cart in place (no pan servo, no tilt
+    axis). Fixed-speed bang-bang: target detected and not centred horizontally → `off_x < 0`
+    (target left of frame) calls `hardware.rotate_cw()`, `off_x > 0` calls `rotate_ccw()`;
+    otherwise `hardware.stop_drive()`.
   - **Firing (MOCK):** `hardware.fire()` is called every `_FIRE_INTERVAL` (2 s) while a game
     runs, regardless of centering, so the scoring pipeline works without real hardware. A
     code comment marks where to restore centred-only firing once the gun exists.
-  - Game stopped → `hardware.home()` (servos center, fire off).
+  - Game stopped → `hardware.home()` (cart stop, fire off).
 - **UPS poller** (started by `ups_monitor.start()`) — reads INA219 every 2 s.
 
 The `_target_state` dict (`{detected, centered, off_x, off_y}`) is the handoff point between
 the vision thread and the game loop. It is written under `_target_lock` in `_process()` at
-every possible code path (no-target early returns and the success path).
+every possible code path (no-target early returns and the success path). `centered` is
+**horizontal-only** (inside the X deadzone) because aiming is left/right cart rotation; the
+overlay only draws LEFT/RIGHT "ROTATE" arrows now (the UP/DOWN tilt arrows were removed).
 
 Detection pipeline in `_process()`:
 1. BGR → HSV conversion.
@@ -199,23 +208,30 @@ Flask routes: `GET /`, `GET /video_feed` (MJPEG at JPEG quality 80, ~30 fps),
 
 ### hardware.py — abstraction layer for actuators
 
-`set_pan`, `set_tilt`, `stop_fire` print `[MOCK hw]` output and do nothing else; each has a
-`# TODO:` comment pointing to the exact driver call to drop in. `home()` is a convenience
-wrapper: `set_pan(0) + set_tilt(0) + stop_fire()`.
+**Cart drive is real.** `rotate_cw()`, `rotate_ccw()`, `stop_drive()` drive an **L298N
+H-bridge via gpiozero** `Motor` objects (one per wheel pair). Rotation is a **pivot** — one
+side forward, the other stopped — so `rotate_cw` = left pair forward, `rotate_ccw` = right
+pair forward. Editable constants at the top of the file: the L298N pin map (`_LEFT_IN1/IN2/EN`,
+`_RIGHT_IN1/IN2/EN` in BCM), `_DRIVE_SPEED` (PWM duty 0–1), and `_INVERT_ROTATION` (flip if
+the cart turns the wrong way). If gpiozero / its pin backend can't initialise (e.g. laptop
+dev), the drive functions fall back to `[MOCK hw]` prints. `home()` = `stop_drive() +
+stop_fire()`.
 
-`fire()` is **partially live**: the IR pulse is still a mock (`print("[MOCK hw] FIRE")`), but
-it now also calls `_report_shot()`, which `POST`s to the score app's `/shot` endpoint. The
-score app address comes from `rpiPy/.env` (`SCORE_URL`, default `http://127.0.0.1:5001`;
-optional `SCORE_TIMEOUT_S`); copy `rpiPy/.env.example` → `rpiPy/.env` to configure it. The
-POST failure is logged and swallowed, so an offline score app never stalls the game loop.
+`fire()` / `stop_fire()` are **still mocked** (`print("[MOCK hw] ...")`) with `# TODO:`
+comments for the real IR pulse. `fire()` additionally calls `_report_shot()`, which `POST`s
+to the score app's `/shot` endpoint. The score app address comes from `rpiPy/.env`
+(`SCORE_URL`, default `http://127.0.0.1:5001`; optional `SCORE_TIMEOUT_S`); copy
+`rpiPy/.env.example` → `rpiPy/.env` to configure it. The POST failure is logged and swallowed,
+so an offline score app never stalls the game loop.
 
 Dependencies: `rpiPy/requirements.txt` (flask, opencv-python, numpy, smbus2, requests,
-python-dotenv). **picamera2 is not pip-installable on Raspberry Pi OS** — install it via
-`sudo apt install -y python3-picamera2`.
+python-dotenv, gpiozero). **picamera2 is not pip-installable on Raspberry Pi OS** — install it
+via `sudo apt install -y python3-picamera2`. gpiozero needs a pin backend on the Pi 5
+(**lgpio**: `sudo apt install -y python3-lgpio`); off-Pi it isn't needed (drive mocks itself).
 
-**When hardware arrives:** only `hardware.py` needs to change. The game loop and detection
-pipeline are hardware-agnostic. Tune `_K_PAN` / `_K_TILT` (currently `0.05` deg/px) in
-`camera_stream.py` to eliminate overshoot/oscillation.
+**What's left on `hardware.py`:** the IR fire pulse (still mocked). The cart drive is wired —
+verify rotation direction on the real cart and flip `_INVERT_ROTATION` / adjust pins and
+`_DRIVE_SPEED` as needed. The game loop and detection pipeline are hardware-agnostic.
 
 ### ups_monitor.py — Waveshare UPS Module 3S driver
 
@@ -267,11 +283,15 @@ misses (amber) flank the big red hit count.
       (real HTTP calls; probe `/start`/`/stop` flip `_game_active` Event).
 - [x] Wire the probe to report fired shots — `hardware.fire()` POSTs `/shot` to the score app
       (port 5001) each time it fires (mock fires every 2 s while a game runs).
-- [ ] Wire `hardware.py` — replace mock stubs (servos + real IR fire pulse) with real drivers,
-      and restore centred-only firing in `_game_loop` (currently a 2 s mock cadence).
-- [ ] Tune `_K_PAN` / `_K_TILT` gain constants once servos are connected.
-- [ ] Resolve probe motion: wheeled BO-motor cart vs. the linear-rail + stepper/servo aiming
-      from the original docs — which is current?
+- [x] Wire the cart drive in `hardware.py` — `rotate_cw`/`rotate_ccw`/`stop_drive` drive the
+      **L298N via gpiozero**; `_game_loop` rotates the cart (fixed-speed bang-bang) to aim.
+- [ ] On the real cart: verify rotation direction (flip `_INVERT_ROTATION` if mirrored),
+      confirm the L298N pin map, and tune `_DRIVE_SPEED` for clean stops without overshoot.
+- [ ] Wire the **IR fire pulse** in `hardware.py` (still mocked), and restore centred-only
+      firing in `_game_loop` (currently a 2 s mock cadence).
+- [x] Resolve probe motion: the **wheeled BO-motor cart** is it — it rotates in place to aim
+      (camera side-mounted). The linear-rail + stepper/servo and the pan/tilt servos are
+      **dropped**; no tilt axis.
 - [ ] Choose the Pi-side 38 kHz IR generation method (pigpio PWM / LIRC / oscillator circuit).
 - [ ] Upgrade detection from HSV red-shirt to YOLO `person` + HSV vest-color filter.
 - [ ] Pick and physically test the vest color for the HSV filter under game lighting.

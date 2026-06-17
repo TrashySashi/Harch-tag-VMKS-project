@@ -26,17 +26,10 @@ _target_state = {"detected": False, "centered": False, "off_x": 0, "off_y": 0}
 
 _game_active = threading.Event()
 
-# Proportional-controller gains (degrees of servo movement per pixel of offset).
-# Tune these once real servos are connected.
-_K_PAN  = 0.05
-_K_TILT = 0.05
 # MOCK: while the firing hardware doesn't exist, the probe fires on a fixed
 # cadence whenever a game is running, instead of only when a target is centred.
 # Swap back to centred-only firing once real hardware is wired (see _game_loop).
 _FIRE_INTERVAL = 2.0   # seconds between mock shots
-
-_pan_angle  = 0.0
-_tilt_angle = 0.0
 
 # Red wraps around both ends of the HSV hue wheel (0-10 and 170-180)
 _RED_LOWER1 = np.array([0,   110,  60])
@@ -55,7 +48,9 @@ _CENTROID_COLOR= (0, 255, 255)   # yellow
 
 
 def _draw_arrow(frame, direction, h, w):
-    cx, cy = w // 2, h // 2
+    # Camera is side-mounted: horizontal offset maps to rotating the whole cart.
+    # LEFT  arrow → rotate the cart clockwise; RIGHT arrow → anti-clockwise.
+    cy = h // 2
     thick, tip = 5, 0.45
 
     if direction == "LEFT":
@@ -66,16 +61,6 @@ def _draw_arrow(frame, direction, h, w):
     elif direction == "RIGHT":
         cv2.arrowedLine(frame, (w - 110, cy), (w - 30, cy), _ARROW_COLOR, thick, tipLength=tip)
         cv2.putText(frame, "ROTATE RIGHT", (w - 310, cy + 8),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, _ARROW_COLOR, 2)
-
-    elif direction == "UP":
-        cv2.arrowedLine(frame, (cx, 110), (cx, 30), _ARROW_COLOR, thick, tipLength=tip)
-        cv2.putText(frame, "TILT UP",   (cx - 55, 130),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, _ARROW_COLOR, 2)
-
-    elif direction == "DOWN":
-        cv2.arrowedLine(frame, (cx, h - 110), (cx, h - 30), _ARROW_COLOR, thick, tipLength=tip)
-        cv2.putText(frame, "TILT DOWN", (cx - 65, h - 120),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.9, _ARROW_COLOR, 2)
 
 
@@ -145,49 +130,59 @@ def _process(frame):
     cv2.putText(frame, f"offset  X: {pct_x:+.0f}%   Y: {pct_y:+.0f}%",
                 (10, h - 14), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (200, 200, 200), 1)
 
-    # Directional arrows / centred label
+    # Only the horizontal axis matters: the side-mounted camera aims by rotating
+    # the cart, and there is no tilt axis. "Centred" = inside the X deadzone.
     in_x = abs(off_x) <= dz_x
-    in_y = abs(off_y) <= dz_y
 
     with _target_lock:
         _target_state.update({
             "detected": True,
-            "centered": in_x and in_y,
+            "centered": in_x,
             "off_x":    off_x,
             "off_y":    off_y,
         })
 
-    if in_x and in_y:
+    if in_x:
         cv2.putText(frame, "CENTERED", (cx - 75, 50),
                     cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0, 255, 0), 2)
     else:
-        if not in_x:
-            _draw_arrow(frame, "LEFT"  if off_x < 0 else "RIGHT", h, w)
-        if not in_y:
-            _draw_arrow(frame, "UP"    if off_y < 0 else "DOWN",  h, w)
+        _draw_arrow(frame, "LEFT" if off_x < 0 else "RIGHT", h, w)
 
     return frame
 
 
 def _game_loop():
-    global _pan_angle, _tilt_angle
     while True:
         _game_active.wait()           # idle until /start
         print("[game] started")
-        _pan_angle = _tilt_angle = 0.0
-        hardware.home()
+        hardware.home()               # cart stopped, fire off
         last_fire = time.time()       # first mock shot one interval after start
+        last_action = None            # for change-only debug logging
 
         while _game_active.is_set():
             with _target_lock:
                 state = dict(_target_state)
 
-            # Aim: nudge servos toward the target when one is detected off-centre.
+            # Aim: the camera is side-mounted, so horizontal aiming = rotating
+            # the whole cart. Fixed-speed bang-bang — spin while a target is
+            # detected and off-centre, stop otherwise. off_x < 0 (target left of
+            # frame) → clockwise; off_x > 0 (target right) → anti-clockwise.
             if state["detected"] and not state["centered"]:
-                _pan_angle  += _K_PAN  * state["off_x"]
-                _tilt_angle += _K_TILT * state["off_y"]
-                hardware.set_pan(_pan_angle)
-                hardware.set_tilt(_tilt_angle)
+                action = "CW" if state["off_x"] < 0 else "CCW"
+                if state["off_x"] < 0:
+                    hardware.rotate_cw()
+                else:
+                    hardware.rotate_ccw()
+            else:
+                action = "STOP"
+                hardware.stop_drive()
+
+            # Debug: print only when the decision changes, so you can see whether
+            # the loop is reaching the rotate calls (remove once tuned).
+            if action != last_action:
+                print(f"[game] detected={state['detected']} "
+                      f"centered={state['centered']} off_x={state['off_x']} -> {action}")
+                last_action = action
 
             # Fire: MOCK — fire on a fixed cadence while the game runs. Replace
             # with `if state["detected"] and state["centered"]:` once the real

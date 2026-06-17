@@ -63,18 +63,19 @@ These supersede anything in the original Word documentation:
 |---|---|
 | Vision, motion, aiming & fire control | Raspberry Pi 5, 8 GB — drives everything directly; **no separate ESP32 on the probe** |
 | Camera | Raspberry Pi Camera Module 3 Standard (Adafruit 5657), 12 MP autofocus, 75° FOV, CSI |
-| Movement (roaming) | Wheeled cart from TU — 4× Dual-Shaft BO DC geared motors |
-| Motor driver | H-bridge (e.g. L298N), tank/differential steering (left pair + right pair) |
-| Aiming (per original docs) | NEMA17 stepper (X) + TMC2209 driver, servo (Y), MGN12H 400 mm linear rail |
+| Movement + horizontal aiming | Wheeled cart from TU — 4× Dual-Shaft BO DC geared motors; the cart **rotates in place to aim** (camera is side-mounted) |
+| Motor driver | **L298N H-bridge driven by the Pi via gpiozero**, tank/differential steering (left pair + right pair) |
+| ~~Aiming (per original docs)~~ | **Superseded:** the NEMA17 stepper + TMC2209 + servo + MGN12H linear rail are **not used**. Horizontal aiming is cart rotation; there is no tilt axis (fixed gun elevation). |
 | IR "gun" emitter | 10× TSAL6200 940 nm IR LEDs, driven via AO3407 MOSFETs, modulated at 38 kHz |
 | Cooling | Fan for the Pi during inference |
 | Levitation effect | Magnets (Eddy-current approach) — aspirational/experimental |
 | Power | Dedicated supplies for compute and motors (separate motor battery) |
 
-> **Open item:** the relationship between the wheeled cart (4 BO motors) and the
-> linear-rail + stepper/servo aiming system from the original docs is not fully resolved.
-> The cart provides gross movement; the stepper/servo were specified for fine aiming.
-> Confirm with the developer which is current before building motion code.
+> **Resolved:** the wheeled cart is the motion + aiming system. With the camera mounted on
+> the **side** of the cart, the cart **rotates in place to aim horizontally**, so the
+> linear-rail + stepper/servo fine-aiming system from the original docs is **dropped**.
+> There is no tilt axis (fixed gun elevation). Motion code lives in `rpiPy/hardware.py`
+> (L298N via gpiozero).
 
 ### Vest (the target)
 
@@ -119,9 +120,22 @@ contour above 3000 px², centroid (cx, cy), X/Y offset from frame center as pixe
   the Pi-side IR-generation method; IRremote is Arduino-only and won't run on the Pi.
 
 ### Motion control
-- ESP32 drives the H-bridge: two direction pins + one **PWM** pin per motor channel
-  control direction and speed. **Tie controller ground to motor-battery ground.** Never
-  drive motors directly from MCU/Pi pins.
+- **The Raspberry Pi 5 drives the cart directly** (no probe ESP32) through an **L298N
+  H-bridge**, using the **gpiozero** `Motor` class. Two direction pins + one **PWM** enable
+  pin per channel control direction and speed. **Tie L298N ground to motor-battery ground.**
+  Never drive motors directly from Pi pins.
+- **Tank/differential steering, 4 wheels:** the two LEFT wheels are one channel, the two
+  RIGHT wheels are the other.
+- **The camera is mounted on the SIDE of the cart, so horizontal aiming = rotating the whole
+  cart in place** (there is **no pan servo**). There is **no tilt axis** either — gun
+  elevation is fixed; only the left/right rotation aims at the player.
+- **Rotation = pivot** (drive one side, the other stays stopped), **fixed-speed bang-bang**:
+  spin while the detected target is outside the horizontal deadzone, stop when centred.
+  Mapping (set from the camera's `off_x`): target to the **left** of frame → **clockwise**;
+  to the **right** → **anti-clockwise**.
+- Pin map, drive speed, and an `_INVERT_ROTATION` flag are editable constants at the top of
+  `rpiPy/hardware.py`. If gpiozero/its pin backend isn't available (e.g. laptop dev), the
+  drive functions fall back to `[MOCK hw]` prints so the pipeline still runs.
 
 ### Communication
 - The **vest (ESP32-WROOM-32)** reports hit events to the **Pi 5** (and/or a scoring
@@ -179,24 +193,30 @@ Three files, each with a single responsibility:
 | File | Role |
 |---|---|
 | `camera_stream.py` | Flask server (port 5000): camera capture, HSV red-shirt detection, MJPEG stream, game loop, UPS page |
-| `hardware.py` | Hardware abstraction for pan/tilt servos + firing mechanism — **servos/fire still mocked** (print stubs with TODO comments), but `fire()` already reports each shot to the score app via `POST /shot` |
+| `hardware.py` | Hardware abstraction for **cart movement (aiming) + firing** — cart rotation is **real** (L298N via gpiozero, with off-Pi mock fallback); the IR fire pulse is still a mock print, but `fire()` already reports each shot to the score app via `POST /shot` |
 | `ups_monitor.py` | INA219 I2C driver for the Waveshare UPS Module 3S (I2C bus 1, addr `0x41`); background thread polls every 2 s; safe to call even if UPS is absent |
 
 **`camera_stream.py` internals:**
 - **Three daemon threads:** `_capture_loop` (grab + process frames), `_game_loop` (20 Hz
-  P-controller), and the UPS poller started by `ups_monitor.start()`.
+  control loop), and the UPS poller started by `ups_monitor.start()`.
 - **`_target_state` dict** (lock-protected): written by `_process()` every frame with
-  `{detected, centered, off_x, off_y}`. Read by `_game_loop` to decide servo/fire actions.
-- **Game loop logic:** while `_game_active` is set → if a target is detected and not centered,
-  nudge pan/tilt servos proportionally (`_K_PAN = 0.05`, `_K_TILT = 0.05` deg/px). **Firing is
-  currently a MOCK on a fixed cadence:** `hardware.fire()` is called every `_FIRE_INTERVAL`
-  (2 s) while a game runs, regardless of centering, so the scoring pipeline can be exercised
-  end-to-end without real hardware. The code comment marks where to restore centred-only
-  firing once the firing hardware exists. On stop: `hardware.home()`.
-- **`hardware.py` swap points:** `set_pan`/`set_tilt`/`stop_fire` have a single `# TODO:` line
-  each; `fire()` prints `[MOCK hw] FIRE` **and** POSTs `/shot` to the score app (`SCORE_URL`
-  from `rpiPy/.env`, default `http://127.0.0.1:5001`). `_K_PAN`/`_K_TILT` need tuning once
-  real servos are connected.
+  `{detected, centered, off_x, off_y}`. `centered` is now **horizontal-only** (inside the X
+  deadzone) since there is no tilt axis; `off_y` is kept only for the on-screen readout. Read
+  by `_game_loop` to decide cart/fire actions.
+- **Game loop logic:** while `_game_active` is set → if a target is detected and not centred
+  horizontally, **rotate the whole cart** (camera is side-mounted) at a fixed speed:
+  `off_x < 0` (target left of frame) → `hardware.rotate_cw()`; `off_x > 0` → `rotate_ccw()`.
+  Otherwise `hardware.stop_drive()`. **Firing is currently a MOCK on a fixed cadence:**
+  `hardware.fire()` is called every `_FIRE_INTERVAL` (2 s) while a game runs, regardless of
+  centring, so the scoring pipeline can be exercised end-to-end. The code comment marks where
+  to restore centred-only firing once the firing hardware exists. On stop: `hardware.home()`.
+- **`hardware.py` cart drive:** `rotate_cw`/`rotate_ccw`/`stop_drive` drive the L298N via
+  gpiozero (pivot = one side forward, the other stopped). Editable constants at the top:
+  L298N pin map (`_LEFT_*`/`_RIGHT_*`, BCM), `_DRIVE_SPEED`, and `_INVERT_ROTATION` (flip if
+  the cart turns the wrong way). If gpiozero can't initialise (off-Pi), the functions print
+  `[MOCK hw]` instead. **Still mocked:** the IR fire pulse — `fire()` prints `[MOCK hw] FIRE`
+  **and** POSTs `/shot` to the score app (`SCORE_URL` from `rpiPy/.env`, default
+  `http://127.0.0.1:5001`).
 - **Flask routes:** `GET /` (camera viewer), `GET /video_feed` (MJPEG), `POST /start`,
   `POST /stop`, `GET /ups`, `GET /ups/data`.
 - **Setup:** `pip install -r rpiPy/requirements.txt` (picamera2 comes from apt:
@@ -231,8 +251,9 @@ Three files, each with a single responsibility:
   Hits only count while a round is active.
 - **Pi 5 (probe):** `camera_stream.py` runs on port 5000. `/start` sets `_game_active`; the
   game loop (20 Hz) reads `_target_state` from the vision thread and drives hardware via
-  `hardware.py` (servos/fire still mocked). While mocked, `hardware.fire()` runs every 2 s and
-  reports each shot to the score app (`POST /shot`), so shots/misses populate end-to-end.
+  `hardware.py` — **cart rotation is real (L298N via gpiozero); the IR fire pulse is still
+  mocked**. `hardware.fire()` runs every 2 s while a game is active and reports each shot to
+  the score app (`POST /shot`), so shots/misses populate end-to-end.
   `/stop` clears `_game_active` and calls `hardware.home()`. Current detection: HSV red-shirt;
   planned: YOLO `person`.
 - **Vest ESP32-WROOM-32:** detects hits, runs local feedback, reports each hit to the score
