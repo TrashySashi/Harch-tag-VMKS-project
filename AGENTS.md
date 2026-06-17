@@ -81,7 +81,7 @@ These supersede anything in the original Word documentation:
 | Function | Hardware |
 |---|---|
 | Controller | ESP32-WROOM-32 DevKitC (dual-core Xtensa; Wi-Fi + Bluetooth Classic + BLE) |
-| Hit detection | 10× TSOP38238 (38 kHz IR receiver modules) — front, back, shoulders for ~360° coverage |
+| Hit detection | 10× TSOP38238 (38 kHz IR receiver modules) — arrayed across the **chest (front only)** for forward-facing coverage; domes all point forward, with the left/right columns angled ~30° outward. (Back/shoulder/360° coverage was dropped to simplify the build.) |
 | Per-sensor noise filter | ~100 Ω series resistor on VCC + ~4.7 µF cap across VCC–GND (per datasheet) |
 | Player feedback (planned) | Buzzer, LED, vibration motor (motor driven via transistor) |
 | Power | Li-ion + UPS/charger module, regulated to 3.3 V |
@@ -242,7 +242,8 @@ Three files, each with a single responsibility:
 1. One TSOP + ESP32-WROOM-32 → print "HIT" on serial when it sees the gun.
 2. Gun side: TSAL6200 + IRremote sending a shot code; vest decodes and validates it.
 3. Add feedback (buzzer/LED/vibration).
-4. Scale to 10 TSOPs (OUT lines may be tied together if only hit/no-hit is needed).
+4. Scale to 10 TSOPs in a chest array (front only; 3–4–3 grid or similar, domes forward,
+   edge columns angled ~30° out). OUT lines may be tied together since only hit/no-hit is needed.
 5. Add BLE reporting.
 6. Add battery + make wearable.
 
