@@ -3,6 +3,12 @@
 Context for AI agents working on the HArch Tag project. Read this before generating
 code, wiring, or documentation so suggestions match the actual hardware and design decisions.
 
+**Documentation maintenance rule:** Whenever a change is made to the codebase — new files,
+removed files, renamed endpoints, changed hardware roles, updated software architecture, or
+any other structural modification — the relevant sections of this file (AGENTS.md) and any
+other documentation files in the project must be updated to reflect the new state. Do not
+leave documentation describing code or structure that no longer exists.
+
 ## Project overview
 
 HArch Tag is a **single-player laser-tag game** inspired by the *Marksman-H training
