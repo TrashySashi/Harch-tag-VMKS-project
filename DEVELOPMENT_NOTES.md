@@ -160,11 +160,78 @@ sidesteps the missing-CC-resistor problem some cheap USB-C boards have with C-to
 
 ---
 
+## 11. What is actually implemented (rpiPy/)
+
+### camera_stream.py — Flask probe server (port 5000)
+
+Fully working on the Pi. Three daemon threads run concurrently:
+
+- **`_capture_loop`** — grabs frames from the Pi Camera Module 3 via Picamera2 (1280×720,
+  30 fps, RGB888). Calls `_process()` on each frame and stores the result in `_latest_frame`.
+- **`_game_loop`** — 20 Hz P-controller. Reads `_target_state` (written by `_process`) and
+  drives hardware:
+  - Target not centered → nudge pan/tilt angles by `off_x * _K_PAN` / `off_y * _K_TILT`
+    and call `hardware.set_pan()` / `hardware.set_tilt()`.
+  - Target centered → call `hardware.fire()` at most once per second (`_FIRE_COOLDOWN`).
+  - Game stopped → `hardware.home()` (servos center, fire off).
+- **UPS poller** (started by `ups_monitor.start()`) — reads INA219 every 2 s.
+
+The `_target_state` dict (`{detected, centered, off_x, off_y}`) is the handoff point between
+the vision thread and the game loop. It is written under `_target_lock` in `_process()` at
+every possible code path (no-target early returns and the success path).
+
+Detection pipeline in `_process()`:
+1. BGR → HSV conversion.
+2. Two-range red mask (hue wraps: 0–10° and 170–180°).
+3. Morphological open + dilate to remove noise.
+4. Largest contour above 3 000 px² → centroid → X/Y offset from frame center.
+5. Draws green contour, yellow centroid, crosshair, deadzone box, orange directional arrows
+   or "CENTERED" label. Writes offset % to bottom-left of frame.
+
+Flask routes: `GET /`, `GET /video_feed` (MJPEG at JPEG quality 80, ~30 fps),
+`POST /start`, `POST /stop`, `GET /ups`, `GET /ups/data`.
+
+### hardware.py — abstraction layer for actuators
+
+All four functions (`set_pan`, `set_tilt`, `fire`, `stop_fire`) print `[MOCK hw]` output and
+do nothing else. Each has a `# TODO:` comment pointing to the exact driver call to drop in.
+`home()` is a convenience wrapper: `set_pan(0) + set_tilt(0) + stop_fire()`.
+
+**When hardware arrives:** only `hardware.py` needs to change. The game loop and detection
+pipeline are hardware-agnostic. Tune `_K_PAN` / `_K_TILT` (currently `0.05` deg/px) in
+`camera_stream.py` to eliminate overshoot/oscillation.
+
+### ups_monitor.py — Waveshare UPS Module 3S driver
+
+INA219 on I2C bus 1, address `0x41`. Reads bus voltage, shunt voltage, current, power.
+Derives battery % from voltage (9.0 V = 0%, 12.6 V = 100% for 3S Li-ion). Charging detected
+when current < −50 mA. Background thread polls every 2 s; `start()` is safe to call even
+if the UPS is not connected (prints a warning and returns silently).
+
+### score_server.py — what changed from the original "mocked" description
+
+`start_probe()` / `stop_probe()` were never log-only no-ops — they always POSTed to
+`PROBE_URL` (configurable via `.env`). What was missing was the probe-side logic; that is
+now implemented. The full call chain is:
+```
+Browser → POST /start (score_server :5001)
+  → start_probe() → POST http://<pi>:5000/start
+    → _game_active.set()  (camera_stream.py)
+      → _game_loop() begins tracking and firing
+```
+
+---
+
 ## 10. Open items / TODO
 
+- [x] Wire score app `start_probe()` / `stop_probe()` to the probe server — **done**
+      (real HTTP calls; probe `/start`/`/stop` flip `_game_active` Event).
+- [ ] Wire `hardware.py` — replace mock stubs with real servo driver + fire mechanism.
+- [ ] Tune `_K_PAN` / `_K_TILT` gain constants once servos are connected.
 - [ ] Resolve probe motion: wheeled BO-motor cart vs. the linear-rail + stepper/servo aiming
       from the original docs — which is current?
 - [ ] Choose the Pi-side 38 kHz IR generation method (pigpio PWM / LIRC / oscillator circuit).
+- [ ] Upgrade detection from HSV red-shirt to YOLO `person` + HSV vest-color filter.
 - [ ] Pick and physically test the vest color for the HSV filter under game lighting.
 - [ ] Source resistors (and the rest of the BOM) for the physical build.
 - [ ] Confirm vest power design (regulated 3.3 V, battery capacity for a play session).

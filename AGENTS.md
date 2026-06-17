@@ -83,17 +83,24 @@ These supersede anything in the original Word documentation:
 ## Software stack
 
 ### Object detection (on the Pi 5)
+
+**Current implementation — HSV color detection (prototype):**
+`rpiPy/camera_stream.py` currently detects the player using HSV color segmentation for a
+**red shirt** — no YOLO required. This runs at full camera rate on the Pi and was chosen to
+get the aiming pipeline working before the heavier YOLO integration. Red requires two HSV
+ranges because it wraps the hue wheel (0–10° and 170–180°). Detection output: largest
+contour above 3000 px², centroid (cx, cy), X/Y offset from frame center as pixels and %.
+
+**Planned upgrade — YOLO person detection:**
 - **Library:** Ultralytics YOLO (`pip install ultralytics`).
-- **Model:** `yolo26n` (nano). Fallback: `yolo11n` if needed. Both use the pre-trained
-  **COCO** dataset; detect the built-in **`person`** class — no training required.
-- **Optimization:** export the model to **NCNN** format (`yolo export ... format=ncnn`)
-  for ARM; roughly doubles FPS. Expect ~8 FPS stock, ~15+ FPS with NCNN on Pi 5 CPU.
-- **Camera capture:** Picamera2 (CSI). Per-frame output is the person bounding box; only
-  the box **center (cx, cy)** is needed for aiming.
-- **Optional vest discrimination by color:** after YOLO finds a `person`, crop to the box
-  and run an **HSV color check** for the vest color (highly saturated, room-rare color
-  e.g. safety orange / hot magenta / lime green). Calibrate the HSV range under real game
-  lighting. This avoids custom model training.
+- **Model:** `yolo26n` (nano). Fallback: `yolo11n`. Pre-trained on **COCO**; detect the
+  built-in **`person`** class — no training required.
+- **Optimization:** export to **NCNN** format for ARM; ~doubles FPS (~8 FPS stock →
+  ~15+ FPS). Command: `yolo export model=yolo26n.pt format=ncnn`.
+- **Camera capture:** Picamera2 (CSI). Only the bounding-box **center (cx, cy)** is needed.
+- **Vest discrimination:** after YOLO finds a `person`, crop and run an **HSV** color check
+  for the vest color (highly saturated, room-rare color). Calibrate under real game lighting.
+  Avoids custom model training.
 
 ### IR shot protocol (gun → vest)
 - Treat the gun as a **TV remote** and the vest as the **receiver**.
@@ -129,9 +136,10 @@ These supersede anything in the original Word documentation:
     the probe to begin hunting. The page swaps from the **home screen** to the **scoreboard**.
   - `POST /stop` → set `active=false` and call `stop_probe()` to stand the probe down. The
     page returns to the **home screen** (final score preserved).
-  - `start_probe()` / `stop_probe()` are currently **mocks** (log-only no-ops). They are the
-    seam where the score app will eventually POST to the camera/probe server (port 5000) to
-    actually start/stop detection + aiming. Wiring these is the main open task here.
+  - `start_probe()` / `stop_probe()` make a real `POST` to the probe server at `PROBE_URL`
+    (env var, default `http://127.0.0.1:5000`). The probe's `/start` and `/stop` endpoints
+    flip a `threading.Event` (`_game_active`) that controls the game loop. Network failures
+    are logged and swallowed so an offline probe never crashes the score app.
   - **Hits are only counted while `active`.** A `POST /hit` when no game is running is logged
     and ignored — the vest can't rack up points before the operator starts a round.
 - **The web page shows exactly one screen at a time**, chosen by `active`: the home screen
@@ -148,6 +156,30 @@ These supersede anything in the original Word documentation:
   python scoreApp/score_server.py            # serves on 0.0.0.0:5001
   ```
   The vest then POSTs to `http://<pi-ip>:5001/hit`.
+
+### Probe software (`rpiPy/`)
+
+Three files, each with a single responsibility:
+
+| File | Role |
+|---|---|
+| `camera_stream.py` | Flask server (port 5000): camera capture, HSV red-shirt detection, MJPEG stream, game loop, UPS page |
+| `hardware.py` | Hardware abstraction for pan/tilt servos + firing mechanism — **currently mocked** (print stubs with TODO comments); replace each function body when hardware is wired |
+| `ups_monitor.py` | INA219 I2C driver for the Waveshare UPS Module 3S (I2C bus 1, addr `0x41`); background thread polls every 2 s; safe to call even if UPS is absent |
+
+**`camera_stream.py` internals:**
+- **Three daemon threads:** `_capture_loop` (grab + process frames), `_game_loop` (20 Hz
+  P-controller), and the UPS poller started by `ups_monitor.start()`.
+- **`_target_state` dict** (lock-protected): written by `_process()` every frame with
+  `{detected, centered, off_x, off_y}`. Read by `_game_loop` to decide servo/fire actions.
+- **Game loop logic:** while `_game_active` is set → if target detected but not centered,
+  nudge pan/tilt servos proportionally (`_K_PAN = 0.05`, `_K_TILT = 0.05` deg/px); if
+  centered, call `hardware.fire()` with a 1-second cooldown. On stop: `hardware.home()`.
+- **`hardware.py` swap points:** each function has a single `# TODO:` line showing exactly
+  which driver call to drop in (e.g. `pwm.set_angle(PAN_CHANNEL, angle)`). `_K_PAN` and
+  `_K_TILT` in `camera_stream.py` will need tuning once real servos are connected.
+- **Flask routes:** `GET /` (camera viewer), `GET /video_feed` (MJPEG), `POST /start`,
+  `POST /stop`, `GET /ups`, `GET /ups/data`.
 
 ### Vest firmware (`vest/`)
 - Arduino sketch for the **ESP32-WROOM-32** (`vest/vest.ino`). On a "hit" it connects to
@@ -170,13 +202,13 @@ These supersede anything in the original Word documentation:
 
 ## Control flow between processors
 - **Score app (game controller, on the Pi):** the operator starts/stops a round from its web
-  page. `POST /start` activates scoring and signals the probe to start hunting (`start_probe()`,
-  mocked); `POST /stop` deactivates and stands the probe down (`stop_probe()`, mocked). Hits
-  only count while a round is active.
-- **Pi 5 (probe):** camera capture + YOLO detection → computes target position → drives
-  the motion system (H-bridge for the cart motors, stepper/servo for aiming) **and** fires
-  the IR gun, all from the Pi's own GPIO. Eventually started/stopped by the score app's
-  `start_probe()` / `stop_probe()`.
+  page. `POST /start` activates scoring, resets hits to 0, and calls `start_probe()` which
+  POSTs to the probe server at port 5000. `POST /stop` deactivates and calls `stop_probe()`.
+  Hits only count while a round is active.
+- **Pi 5 (probe):** `camera_stream.py` runs on port 5000. `/start` sets `_game_active`; the
+  game loop (20 Hz) reads `_target_state` from the vision thread and drives hardware via
+  `hardware.py` (currently mocked — servos/fire not yet wired). `/stop` clears `_game_active`
+  and calls `hardware.home()`. Current detection: HSV red-shirt; planned: YOLO `person`.
 - **Vest ESP32-WROOM-32:** detects hits, runs local feedback, reports each hit to the score
   app over Wi-Fi (`POST /hit`).
 
