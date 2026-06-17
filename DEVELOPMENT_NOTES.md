@@ -170,9 +170,11 @@ Fully working on the Pi. Three daemon threads run concurrently:
   30 fps, RGB888). Calls `_process()` on each frame and stores the result in `_latest_frame`.
 - **`_game_loop`** — 20 Hz P-controller. Reads `_target_state` (written by `_process`) and
   drives hardware:
-  - Target not centered → nudge pan/tilt angles by `off_x * _K_PAN` / `off_y * _K_TILT`
-    and call `hardware.set_pan()` / `hardware.set_tilt()`.
-  - Target centered → call `hardware.fire()` at most once per second (`_FIRE_COOLDOWN`).
+  - Target detected and not centered → nudge pan/tilt angles by `off_x * _K_PAN` /
+    `off_y * _K_TILT` and call `hardware.set_pan()` / `hardware.set_tilt()`.
+  - **Firing (MOCK):** `hardware.fire()` is called every `_FIRE_INTERVAL` (2 s) while a game
+    runs, regardless of centering, so the scoring pipeline works without real hardware. A
+    code comment marks where to restore centred-only firing once the gun exists.
   - Game stopped → `hardware.home()` (servos center, fire off).
 - **UPS poller** (started by `ups_monitor.start()`) — reads INA219 every 2 s.
 
@@ -193,9 +195,19 @@ Flask routes: `GET /`, `GET /video_feed` (MJPEG at JPEG quality 80, ~30 fps),
 
 ### hardware.py — abstraction layer for actuators
 
-All four functions (`set_pan`, `set_tilt`, `fire`, `stop_fire`) print `[MOCK hw]` output and
-do nothing else. Each has a `# TODO:` comment pointing to the exact driver call to drop in.
-`home()` is a convenience wrapper: `set_pan(0) + set_tilt(0) + stop_fire()`.
+`set_pan`, `set_tilt`, `stop_fire` print `[MOCK hw]` output and do nothing else; each has a
+`# TODO:` comment pointing to the exact driver call to drop in. `home()` is a convenience
+wrapper: `set_pan(0) + set_tilt(0) + stop_fire()`.
+
+`fire()` is **partially live**: the IR pulse is still a mock (`print("[MOCK hw] FIRE")`), but
+it now also calls `_report_shot()`, which `POST`s to the score app's `/shot` endpoint. The
+score app address comes from `rpiPy/.env` (`SCORE_URL`, default `http://127.0.0.1:5001`;
+optional `SCORE_TIMEOUT_S`); copy `rpiPy/.env.example` → `rpiPy/.env` to configure it. The
+POST failure is logged and swallowed, so an offline score app never stalls the game loop.
+
+Dependencies: `rpiPy/requirements.txt` (flask, opencv-python, numpy, smbus2, requests,
+python-dotenv). **picamera2 is not pip-installable on Raspberry Pi OS** — install it via
+`sudo apt install -y python3-picamera2`.
 
 **When hardware arrives:** only `hardware.py` needs to change. The game loop and detection
 pipeline are hardware-agnostic. Tune `_K_PAN` / `_K_TILT` (currently `0.05` deg/px) in
@@ -218,6 +230,8 @@ Browser → POST /start (score_server :5001)
   → start_probe() → POST http://<pi>:5000/start
     → _game_active.set()  (camera_stream.py)
       → _game_loop() begins tracking and firing
+        → hardware.fire() every 2 s → POST http://<score>:5001/shot
+          → shots/misses update on the scoreboard (SSE)
 ```
 
 ### score_server.py — shots & misses (added)
@@ -237,9 +251,9 @@ The scoreboard now tracks **three** figures instead of one:
 render server-side on load and update live over the existing SSE stream — shots (grey) and
 misses (amber) flank the big red hit count.
 
-> **Not yet wired:** the probe (`rpiPy/`) does not call `POST /shot` yet. `hardware.fire()` /
-> the game loop in `camera_stream.py` will need to report each shot to the score app — left
-> untouched for now per scope.
+> **Now wired:** `hardware.fire()` (`rpiPy/hardware.py`) reports each shot to the score app
+> via `POST /shot`. While the firing hardware is mocked, the game loop fires every 2 s, so
+> `shots`/`misses` populate as soon as a game is started.
 
 ---
 
@@ -247,9 +261,10 @@ misses (amber) flank the big red hit count.
 
 - [x] Wire score app `start_probe()` / `stop_probe()` to the probe server — **done**
       (real HTTP calls; probe `/start`/`/stop` flip `_game_active` Event).
-- [ ] Wire the probe to report fired shots — have `camera_stream.py` `POST /shot` to the
-      score app (port 5001) each time it fires, so the scoreboard's shots/misses are live.
-- [ ] Wire `hardware.py` — replace mock stubs with real servo driver + fire mechanism.
+- [x] Wire the probe to report fired shots — `hardware.fire()` POSTs `/shot` to the score app
+      (port 5001) each time it fires (mock fires every 2 s while a game runs).
+- [ ] Wire `hardware.py` — replace mock stubs (servos + real IR fire pulse) with real drivers,
+      and restore centred-only firing in `_game_loop` (currently a 2 s mock cadence).
 - [ ] Tune `_K_PAN` / `_K_TILT` gain constants once servos are connected.
 - [ ] Resolve probe motion: wheeled BO-motor cart vs. the linear-rail + stepper/servo aiming
       from the original docs — which is current?

@@ -30,7 +30,10 @@ _game_active = threading.Event()
 # Tune these once real servos are connected.
 _K_PAN  = 0.05
 _K_TILT = 0.05
-_FIRE_COOLDOWN = 1.0   # seconds between shots
+# MOCK: while the firing hardware doesn't exist, the probe fires on a fixed
+# cadence whenever a game is running, instead of only when a target is centred.
+# Swap back to centred-only firing once real hardware is wired (see _game_loop).
+_FIRE_INTERVAL = 2.0   # seconds between mock shots
 
 _pan_angle  = 0.0
 _tilt_angle = 0.0
@@ -173,23 +176,26 @@ def _game_loop():
         print("[game] started")
         _pan_angle = _tilt_angle = 0.0
         hardware.home()
-        last_fire = 0.0
+        last_fire = time.time()       # first mock shot one interval after start
 
         while _game_active.is_set():
             with _target_lock:
                 state = dict(_target_state)
 
-            if state["detected"]:
-                if not state["centered"]:
-                    _pan_angle  += _K_PAN  * state["off_x"]
-                    _tilt_angle += _K_TILT * state["off_y"]
-                    hardware.set_pan(_pan_angle)
-                    hardware.set_tilt(_tilt_angle)
-                else:
-                    now = time.time()
-                    if now - last_fire >= _FIRE_COOLDOWN:
-                        hardware.fire()
-                        last_fire = now
+            # Aim: nudge servos toward the target when one is detected off-centre.
+            if state["detected"] and not state["centered"]:
+                _pan_angle  += _K_PAN  * state["off_x"]
+                _tilt_angle += _K_TILT * state["off_y"]
+                hardware.set_pan(_pan_angle)
+                hardware.set_tilt(_tilt_angle)
+
+            # Fire: MOCK — fire on a fixed cadence while the game runs. Replace
+            # with `if state["detected"] and state["centered"]:` once the real
+            # firing hardware exists.
+            now = time.time()
+            if now - last_fire >= _FIRE_INTERVAL:
+                hardware.fire()
+                last_fire = now
 
             time.sleep(0.05)          # 20 Hz control loop
 

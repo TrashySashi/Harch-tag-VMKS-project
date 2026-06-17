@@ -1,0 +1,13 @@
+# Probe server dependencies (rpiPy/)
+#
+# NOTE: picamera2 is NOT installed via pip on Raspberry Pi OS — it ships as a
+# system package. Install it with:  sudo apt install -y python3-picamera2
+# (and run the server with system site-packages available). Everything below
+# is pip-installable.
+
+flask>=3.0
+opencv-python>=4.8
+numpy>=1.24
+smbus2>=0.4          # INA219 / UPS monitor over I2C
+requests>=2.31       # hardware.fire() -> score app POST /shot
+python-dotenv>=1.0   # load SCORE_URL from .env

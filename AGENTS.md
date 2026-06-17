@@ -179,7 +179,7 @@ Three files, each with a single responsibility:
 | File | Role |
 |---|---|
 | `camera_stream.py` | Flask server (port 5000): camera capture, HSV red-shirt detection, MJPEG stream, game loop, UPS page |
-| `hardware.py` | Hardware abstraction for pan/tilt servos + firing mechanism — **currently mocked** (print stubs with TODO comments); replace each function body when hardware is wired |
+| `hardware.py` | Hardware abstraction for pan/tilt servos + firing mechanism — **servos/fire still mocked** (print stubs with TODO comments), but `fire()` already reports each shot to the score app via `POST /shot` |
 | `ups_monitor.py` | INA219 I2C driver for the Waveshare UPS Module 3S (I2C bus 1, addr `0x41`); background thread polls every 2 s; safe to call even if UPS is absent |
 
 **`camera_stream.py` internals:**
@@ -187,14 +187,21 @@ Three files, each with a single responsibility:
   P-controller), and the UPS poller started by `ups_monitor.start()`.
 - **`_target_state` dict** (lock-protected): written by `_process()` every frame with
   `{detected, centered, off_x, off_y}`. Read by `_game_loop` to decide servo/fire actions.
-- **Game loop logic:** while `_game_active` is set → if target detected but not centered,
-  nudge pan/tilt servos proportionally (`_K_PAN = 0.05`, `_K_TILT = 0.05` deg/px); if
-  centered, call `hardware.fire()` with a 1-second cooldown. On stop: `hardware.home()`.
-- **`hardware.py` swap points:** each function has a single `# TODO:` line showing exactly
-  which driver call to drop in (e.g. `pwm.set_angle(PAN_CHANNEL, angle)`). `_K_PAN` and
-  `_K_TILT` in `camera_stream.py` will need tuning once real servos are connected.
+- **Game loop logic:** while `_game_active` is set → if a target is detected and not centered,
+  nudge pan/tilt servos proportionally (`_K_PAN = 0.05`, `_K_TILT = 0.05` deg/px). **Firing is
+  currently a MOCK on a fixed cadence:** `hardware.fire()` is called every `_FIRE_INTERVAL`
+  (2 s) while a game runs, regardless of centering, so the scoring pipeline can be exercised
+  end-to-end without real hardware. The code comment marks where to restore centred-only
+  firing once the firing hardware exists. On stop: `hardware.home()`.
+- **`hardware.py` swap points:** `set_pan`/`set_tilt`/`stop_fire` have a single `# TODO:` line
+  each; `fire()` prints `[MOCK hw] FIRE` **and** POSTs `/shot` to the score app (`SCORE_URL`
+  from `rpiPy/.env`, default `http://127.0.0.1:5001`). `_K_PAN`/`_K_TILT` need tuning once
+  real servos are connected.
 - **Flask routes:** `GET /` (camera viewer), `GET /video_feed` (MJPEG), `POST /start`,
   `POST /stop`, `GET /ups`, `GET /ups/data`.
+- **Setup:** `pip install -r rpiPy/requirements.txt` (picamera2 comes from apt:
+  `sudo apt install -y python3-picamera2`); copy `rpiPy/.env.example` → `rpiPy/.env` and set
+  `SCORE_URL` to the score app's address.
 
 ### Vest firmware (`vest/`)
 - Arduino sketch for the **ESP32-WROOM-32** (`vest/vest.ino`). On a "hit" it connects to
@@ -222,8 +229,10 @@ Three files, each with a single responsibility:
   Hits only count while a round is active.
 - **Pi 5 (probe):** `camera_stream.py` runs on port 5000. `/start` sets `_game_active`; the
   game loop (20 Hz) reads `_target_state` from the vision thread and drives hardware via
-  `hardware.py` (currently mocked — servos/fire not yet wired). `/stop` clears `_game_active`
-  and calls `hardware.home()`. Current detection: HSV red-shirt; planned: YOLO `person`.
+  `hardware.py` (servos/fire still mocked). While mocked, `hardware.fire()` runs every 2 s and
+  reports each shot to the score app (`POST /shot`), so shots/misses populate end-to-end.
+  `/stop` clears `_game_active` and calls `hardware.home()`. Current detection: HSV red-shirt;
+  planned: YOLO `person`.
 - **Vest ESP32-WROOM-32:** detects hits, runs local feedback, reports each hit to the score
   app over Wi-Fi (`POST /hit`).
 
