@@ -42,6 +42,16 @@ load_dotenv()
 
 log = logging.getLogger("harchtag.hardware")
 
+# If nothing has configured logging yet (e.g. running this module standalone for
+# IR diagnostics via `python -c "import hardware; hardware.ir_test()"`), set up a
+# basic INFO handler so the import-time and fire() logs are actually visible.
+# When imported by camera_stream.py its basicConfig wins and this is a no-op.
+if not logging.getLogger().handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
 # Score app base URL (port 5001). Configured via .env so the address isn't
 # hard-coded. e.g. SCORE_URL=http://127.0.0.1:5001
 SCORE_URL = os.getenv("SCORE_URL", "http://127.0.0.1:5001").rstrip("/")
@@ -82,22 +92,61 @@ except Exception as e:  # gpiozero missing or not on a Pi → mock the drive
 # lines are GPIO 12/13/18/19; the cart drive already uses 13 and 18 (EN pins),
 # so the gun uses GPIO 12 = PWM channel 0. Wire the MOSFET gate to GPIO 12.
 #
-# Enable the PWM overlay once on the Pi (then reboot):
-#   echo "dtoverlay=pwm" | sudo tee -a /boot/firmware/config.txt
+# Enable the PWM overlay once on the Pi (then reboot). This both creates the
+# sysfs pwmchip AND muxes the GPIO to its PWM function — without it the carrier
+# toggles in sysfs but never reaches the physical pin, so the LEDs stay dark:
+#   echo "dtoverlay=pwm-2chan,pin=12,func=4,pin2=13,func2=4" \
+#        | sudo tee -a /boot/firmware/config.txt
 # and install the lib:  pip install rpi-hardware-pwm
-_IR_PWM_CHANNEL = 0       # 0 -> GPIO 12, 1 -> GPIO 13, 2 -> GPIO 18, 3 -> GPIO 19
-_IR_PWM_CHIP    = 2       # Pi 5 RP1 pwmchip is 2 (Pi 4 / earlier = 0)
-_IR_FREQ_HZ     = 38000   # TSOP38238 carrier frequency
-_IR_DUTY        = 33      # carrier duty cycle (%) — ~1/3 per IR LED datasheets
-_IR_BURST_S     = 0.10    # how long to hold the carrier on per shot
+#
+# The sysfs pwmchip *number* is not stable across boards/kernels (Pi 4 was 0,
+# some Pi 5 images expose the RP1 PWM as 2, the current 6.18 image as 0, and it
+# can shift again after adding the overlay). So we auto-detect: try the hint
+# below first, then fall back to whichever /sys/class/pwm/pwmchipN actually
+# exists. Set the hint to your known-good chip to skip the scan.
+_IR_PWM_CHANNEL  = 0      # 0 -> GPIO 12, 1 -> GPIO 13, 2 -> GPIO 18, 3 -> GPIO 19
+_IR_PWM_CHIP_HINT = 0     # preferred pwmchip number; auto-detect falls back if absent
+_IR_FREQ_HZ      = 38000  # TSOP38238 carrier frequency
+_IR_DUTY         = 33     # carrier duty cycle (%) — ~1/3 per IR LED datasheets
+_IR_BURST_S      = 0.50   # how long to hold the carrier on per shot
+
+
+def _detect_pwm_chip(hint: int) -> int | None:
+    """Return a pwmchip number that exists in sysfs, or None if there are none.
+
+    Prefers *hint* when ``/sys/class/pwm/pwmchip{hint}`` is present; otherwise
+    returns the lowest-numbered pwmchip found. None means no PWM is exposed at
+    all (overlay missing / off-Pi), which the caller treats as "mock the gun".
+    """
+    if os.path.isdir(f"/sys/class/pwm/pwmchip{hint}"):
+        return hint
+    try:
+        chips = sorted(
+            int(n[len("pwmchip"):])
+            for n in os.listdir("/sys/class/pwm")
+            if n.startswith("pwmchip") and n[len("pwmchip"):].isdigit()
+        )
+    except OSError:
+        return None
+    return chips[0] if chips else None
 
 try:
     from rpi_hardware_pwm import HardwarePWM
 
+    _IR_PWM_CHIP = _detect_pwm_chip(_IR_PWM_CHIP_HINT)
+    if _IR_PWM_CHIP is None:
+        raise RuntimeError(
+            "no /sys/class/pwm/pwmchipN found — add the dtoverlay above and reboot"
+        )
+    if _IR_PWM_CHIP != _IR_PWM_CHIP_HINT:
+        log.info("PWM chip hint %d absent; auto-detected pwmchip%d",
+                 _IR_PWM_CHIP_HINT, _IR_PWM_CHIP)
+
     _ir = HardwarePWM(pwm_channel=_IR_PWM_CHANNEL, hz=_IR_FREQ_HZ, chip=_IR_PWM_CHIP)
     _ir.start(0)          # carrier configured, output off (0% duty) until we fire
     _MOCK_FIRE = False
-    log.info("IR gun ready (hardware PWM %d kHz, channel %d)", _IR_FREQ_HZ, _IR_PWM_CHANNEL)
+    log.info("IR gun ready (hardware PWM %d kHz, chip %d, channel %d)",
+             _IR_FREQ_HZ, _IR_PWM_CHIP, _IR_PWM_CHANNEL)
 except Exception as e:    # rpi-hardware-pwm missing, overlay off, or off-Pi → mock
     _ir = None
     _MOCK_FIRE = True
@@ -165,11 +214,36 @@ def fire() -> None:
     """
     if _MOCK_FIRE:
         print("[MOCK hw] FIRE")
+        log.warning("fire() ran in MOCK mode — no IR carrier emitted "
+                    "(hardware PWM unavailable at import time)")
     else:
+        log.info("fire(): carrier ON  ch=%d chip=%d freq=%dHz duty=%d%% burst=%.3fs",
+                 _IR_PWM_CHANNEL, _IR_PWM_CHIP, _IR_FREQ_HZ, _IR_DUTY, _IR_BURST_S)
         _ir.change_duty_cycle(_IR_DUTY)   # carrier ON → IR LEDs pulse at 38 kHz
         time.sleep(_IR_BURST_S)
         _ir.change_duty_cycle(0)          # carrier OFF
+        log.info("fire(): carrier OFF (burst complete)")
     _report_shot()
+
+
+def ir_test(duration_s: float = 3.0) -> None:
+    """Diagnostic: hold the IR carrier ON for *duration_s* so you can physically
+    confirm the diode emits — point a phone camera at the LED array and look for
+    a faint purple glow (most phone cameras pass 940 nm IR). The game loop's real
+    burst is only ``_IR_BURST_S`` (~0.1 s), far too short to eyeball.
+
+    Run from a REPL on the Pi:  ``python -c "import hardware; hardware.ir_test()"``
+    """
+    if _MOCK_FIRE:
+        print("[MOCK hw] IR TEST (no real carrier — hardware PWM unavailable)")
+        log.warning("ir_test() ran in MOCK mode — IR gun was not initialised")
+        return
+    log.info("ir_test(): carrier ON for %.1fs  ch=%d chip=%d freq=%dHz duty=%d%%",
+             duration_s, _IR_PWM_CHANNEL, _IR_PWM_CHIP, _IR_FREQ_HZ, _IR_DUTY)
+    _ir.change_duty_cycle(_IR_DUTY)
+    time.sleep(duration_s)
+    _ir.change_duty_cycle(0)
+    log.info("ir_test(): carrier OFF")
 
 
 def stop_fire() -> None:
