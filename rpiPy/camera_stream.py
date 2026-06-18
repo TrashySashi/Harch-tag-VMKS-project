@@ -26,10 +26,10 @@ _target_state = {"detected": False, "centered": False, "off_x": 0, "off_y": 0}
 
 _game_active = threading.Event()
 
-# MOCK: while the firing hardware doesn't exist, the probe fires on a fixed
-# cadence whenever a game is running, instead of only when a target is centred.
-# Swap back to centred-only firing once real hardware is wired (see _game_loop).
-_FIRE_INTERVAL = 2.0   # seconds between mock shots
+# The probe fires only when a target is detected and centred (see _game_loop).
+# _FIRE_INTERVAL is the cooldown between shots (rate of fire) so holding the
+# target centred doesn't fire on every 20 Hz tick.
+_FIRE_INTERVAL = 2.0   # seconds between shots while locked on target
 
 # Red wraps around both ends of the HSV hue wheel (0-10 and 170-180)
 _RED_LOWER1 = np.array([0,   110,  60])
@@ -184,11 +184,12 @@ def _game_loop():
                       f"centered={state['centered']} off_x={state['off_x']} -> {action}")
                 last_action = action
 
-            # Fire: MOCK — fire on a fixed cadence while the game runs. Replace
-            # with `if state["detected"] and state["centered"]:` once the real
-            # firing hardware exists.
+            # Fire: only when a target is detected AND centred in the frame
+            # (the gun is fixed to the cart, so "centred horizontally" = aimed).
+            # _FIRE_INTERVAL is the cooldown between shots so a held-on-target
+            # lock doesn't fire every loop tick (20 Hz).
             now = time.time()
-            if now - last_fire >= _FIRE_INTERVAL:
+            if state["detected"] and state["centered"] and now - last_fire >= _FIRE_INTERVAL:
                 hardware.fire()
                 last_fire = now
 

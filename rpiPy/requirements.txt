@@ -15,3 +15,6 @@ gpiozero>=2.0        # cart motor control (L298N) — falls back to mock off-Pi
 # Pi-only pin backend for gpiozero on Raspberry Pi 5. Install on the Pi:
 #   sudo apt install -y python3-lgpio   (or: pip install lgpio)
 # Off-Pi it isn't needed — hardware.py mocks the drive when it can't init.
+rpi-hardware-pwm>=0.2  # 38 kHz IR gun carrier (hardware PWM) — mocks off-Pi
+# Needs the PWM overlay enabled once on the Pi (then reboot):
+#   echo "dtoverlay=pwm" | sudo tee -a /boot/firmware/config.txt

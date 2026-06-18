@@ -114,10 +114,13 @@ contour above 3000 px², centroid (cx, cy), X/Y offset from frame center as pixe
 - **Vest side (ESP32-WROOM-32):** use the **IRremote** library to decode incoming codes
   from the TSOP receivers and compare to the expected "shot" code. Rejects ambient IR;
   supports multiple gun codes later.
-- **Gun side is now on the Raspberry Pi 5** (no probe ESP32). The Pi must generate the
-  38 kHz modulated burst on the TSAL6200 LEDs itself — e.g. via `pigpio` hardware PWM,
-  LIRC, or a small dedicated 555/oscillator circuit gated by a GPIO. **Open item:** pick
-  the Pi-side IR-generation method; IRremote is Arduino-only and won't run on the Pi.
+- **Gun side is now on the Raspberry Pi 5** (no probe ESP32). **Resolved:** the Pi
+  generates the 38 kHz modulated burst on the TSAL6200 LEDs with the **kernel hardware PWM**
+  via the `rpi-hardware-pwm` library (clean, jitter-free carrier on the Pi 5's RP1). The PWM
+  line drives the MOSFET gate; `hardware.fire()` holds the carrier on for a short burst
+  (`_IR_BURST_S`) per shot. The current vest reports a hit on any 38 kHz falling edge, so a
+  plain burst registers — no NEC/remote code needed. (IRremote is Arduino-only and won't run
+  on the Pi.)
 
 ### Motion control
 - **The Raspberry Pi 5 drives the cart directly** (no probe ESP32) through an **L298N
@@ -193,7 +196,7 @@ Three files, each with a single responsibility:
 | File | Role |
 |---|---|
 | `camera_stream.py` | Flask server (port 5000): camera capture, HSV red-shirt detection, MJPEG stream, game loop, UPS page |
-| `hardware.py` | Hardware abstraction for **cart movement (aiming) + firing** — cart rotation is **real** (L298N via gpiozero, with off-Pi mock fallback); the IR fire pulse is still a mock print, but `fire()` already reports each shot to the score app via `POST /shot` |
+| `hardware.py` | Hardware abstraction for **cart movement (aiming) + firing** — both **real**: cart rotation (L298N via gpiozero) and the IR fire pulse (38 kHz hardware-PWM burst via `rpi-hardware-pwm`), each with an off-Pi mock fallback; `fire()` also reports each shot to the score app via `POST /shot` |
 | `ups_monitor.py` | INA219 I2C driver for the Waveshare UPS Module 3S (I2C bus 1, addr `0x41`); background thread polls every 2 s; safe to call even if UPS is absent |
 
 **`camera_stream.py` internals:**
@@ -206,17 +209,22 @@ Three files, each with a single responsibility:
 - **Game loop logic:** while `_game_active` is set → if a target is detected and not centred
   horizontally, **rotate the whole cart** (camera is side-mounted) at a fixed speed:
   `off_x < 0` (target left of frame) → `hardware.rotate_cw()`; `off_x > 0` → `rotate_ccw()`.
-  Otherwise `hardware.stop_drive()`. **Firing is currently a MOCK on a fixed cadence:**
-  `hardware.fire()` is called every `_FIRE_INTERVAL` (2 s) while a game runs, regardless of
-  centring, so the scoring pipeline can be exercised end-to-end. The code comment marks where
-  to restore centred-only firing once the firing hardware exists. On stop: `hardware.home()`.
+  Otherwise `hardware.stop_drive()`. **Firing is centred-only:** `hardware.fire()` is called
+  only when a target is **detected and centred** in the X deadzone (the gun is fixed to the
+  cart, so centred = aimed), with `_FIRE_INTERVAL` (2 s) as the rate-of-fire cooldown so a
+  held lock doesn't fire every loop tick. On stop: `hardware.home()`.
 - **`hardware.py` cart drive:** `rotate_cw`/`rotate_ccw`/`stop_drive` drive the L298N via
   gpiozero (pivot = one side forward, the other stopped). Editable constants at the top:
   L298N pin map (`_LEFT_*`/`_RIGHT_*`, BCM), `_DRIVE_SPEED`, and `_INVERT_ROTATION` (flip if
   the cart turns the wrong way). If gpiozero can't initialise (off-Pi), the functions print
-  `[MOCK hw]` instead. **Still mocked:** the IR fire pulse — `fire()` prints `[MOCK hw] FIRE`
-  **and** POSTs `/shot` to the score app (`SCORE_URL` from `rpiPy/.env`, default
-  `http://127.0.0.1:5001`).
+  `[MOCK hw]` instead. **IR fire pulse is real:** `fire()` drives the TSAL6200 array via a
+  38 kHz **hardware-PWM** carrier (`rpi-hardware-pwm`) for `_IR_BURST_S` per shot, **and**
+  POSTs `/shot` to the score app (`SCORE_URL` from `rpiPy/.env`, default
+  `http://127.0.0.1:5001`). IR constants at the top of the file: `_IR_PWM_CHANNEL`
+  (defaults to channel 0 = GPIO 12; motors already use 13 & 18), `_IR_PWM_CHIP` (2 on Pi 5),
+  `_IR_FREQ_HZ`, `_IR_DUTY`, `_IR_BURST_S`. If the PWM can't init (off-Pi or overlay off),
+  `fire()` prints `[MOCK hw] FIRE`. Enable the overlay once: `dtoverlay=pwm` in
+  `/boot/firmware/config.txt`, then reboot.
 - **Flask routes:** `GET /` (camera viewer), `GET /video_feed` (MJPEG), `POST /start`,
   `POST /stop`, `GET /ups`, `GET /ups/data`.
 - **Setup:** `pip install -r rpiPy/requirements.txt` (picamera2 comes from apt:
@@ -251,9 +259,10 @@ Three files, each with a single responsibility:
   Hits only count while a round is active.
 - **Pi 5 (probe):** `camera_stream.py` runs on port 5000. `/start` sets `_game_active`; the
   game loop (20 Hz) reads `_target_state` from the vision thread and drives hardware via
-  `hardware.py` — **cart rotation is real (L298N via gpiozero); the IR fire pulse is still
-  mocked**. `hardware.fire()` runs every 2 s while a game is active and reports each shot to
-  the score app (`POST /shot`), so shots/misses populate end-to-end.
+  `hardware.py` — **both cart rotation (L298N via gpiozero) and the IR fire pulse (38 kHz
+  hardware-PWM burst) are real**. `hardware.fire()` runs only when the target is detected and
+  centred (rate-limited by `_FIRE_INTERVAL`) and reports each shot to the score app
+  (`POST /shot`), so shots/misses populate end-to-end.
   `/stop` clears `_game_active` and calls `hardware.home()`. Current detection: HSV red-shirt;
   planned: YOLO `person`.
 - **Vest ESP32-WROOM-32:** detects hits, runs local feedback, reports each hit to the score
