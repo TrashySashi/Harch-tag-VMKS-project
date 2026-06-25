@@ -223,8 +223,11 @@ Three files, each with a single responsibility:
   `http://127.0.0.1:5001`). IR constants at the top of the file: `_IR_PWM_CHANNEL`
   (defaults to channel 0 = GPIO 12; motors already use 13 & 18), `_IR_PWM_CHIP` (2 on Pi 5),
   `_IR_FREQ_HZ`, `_IR_DUTY`, `_IR_BURST_S`. If the PWM can't init (off-Pi or overlay off),
-  `fire()` prints `[MOCK hw] FIRE`. Enable the overlay once: `dtoverlay=pwm` in
-  `/boot/firmware/config.txt`, then reboot.
+  `fire()` prints `[MOCK hw] FIRE`. Enable the overlay once:
+  `dtoverlay=pwm,pin=12,func=4` in `/boot/firmware/config.txt`, then reboot. Use the
+  **single-channel** overlay — `pwm-2chan` (pin2=13) would mux GPIO 13 to the PWM
+  peripheral, but GPIO 13 is the left motor's L298N enable pin, which would kill the
+  left wheels.
 - **Flask routes:** `GET /` (camera viewer), `GET /video_feed` (MJPEG), `POST /start`,
   `POST /stop`, `GET /ups`, `GET /ups/data`.
 - **Setup:** `pip install -r rpiPy/requirements.txt` (picamera2 comes from apt:

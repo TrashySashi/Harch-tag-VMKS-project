@@ -95,9 +95,13 @@ except Exception as e:  # gpiozero missing or not on a Pi → mock the drive
 # Enable the PWM overlay once on the Pi (then reboot). This both creates the
 # sysfs pwmchip AND muxes the GPIO to its PWM function — without it the carrier
 # toggles in sysfs but never reaches the physical pin, so the LEDs stay dark:
-#   echo "dtoverlay=pwm-2chan,pin=12,func=4,pin2=13,func2=4" \
-#        | sudo tee -a /boot/firmware/config.txt
+#   echo "dtoverlay=pwm,pin=12,func=4" | sudo tee -a /boot/firmware/config.txt
 # and install the lib:  pip install rpi-hardware-pwm
+#
+# Use the SINGLE-channel overlay above, not pwm-2chan. The 2-channel form
+# (pin2=13) muxes GPIO 13 to the PWM peripheral, but GPIO 13 is the LEFT
+# motor's L298N enable pin (see _LEFT_EN) — claiming it there kills the left
+# wheels. The gun only needs channel 0 / GPIO 12.
 #
 # The sysfs pwmchip *number* is not stable across boards/kernels (Pi 4 was 0,
 # some Pi 5 images expose the RP1 PWM as 2, the current 6.18 image as 0, and it

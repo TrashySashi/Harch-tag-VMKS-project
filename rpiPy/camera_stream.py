@@ -8,7 +8,7 @@ import logging
 import ups_monitor
 import hardware
 
-# Surface the harchtag.* loggers (INFO+) — without this the hardware module's
+# Surface the h                                                   archtag.* loggers (INFO+) — without this the hardware module's
 # logs (e.g. "IR gun ready" vs "IR gun mocked", per-shot carrier ON/OFF) are
 # dropped by Python's last-resort handler and you can't see the IR path at all.
 logging.basicConfig(
